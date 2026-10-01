@@ -1,11 +1,20 @@
 //! CTAP2 dispatch and authenticatorGetInfo against CTAP 2.2 §6.4 and §8. Expected responses are
 //! written out byte by byte, never produced by the code under test.
 
-use super::{AAGUID, Authenticator, CommandCode, Settings, StatusCode, UnknownCommand};
+use super::{
+    AAGUID, Authenticator, CommandCode, MaxMsgSize, Settings, StatusCode, TooSmall,
+    UnknownCommand,
+};
 use crate::cbor::{self, validate};
 
+fn settings() -> Settings {
+    Settings {
+        max_msg_size: MaxMsgSize::try_from(1024).expect("at least 1024"),
+    }
+}
+
 fn process(request: &[u8]) -> Vec<u8> {
-    let mut authenticator = Authenticator::new(Settings { max_msg_size: 1024 });
+    let mut authenticator = Authenticator::new(settings());
     let mut response = [0u8; 256];
     let length = authenticator.process(request, &mut response);
     response[..length].to_vec()
@@ -61,11 +70,21 @@ fn unimplemented_commands_are_invalid_command() {
 /// A response that does not fit is CTAP1_ERR_OTHER, and an empty buffer gets nothing.
 #[test]
 fn a_response_that_does_not_fit_is_other() {
-    let mut authenticator = Authenticator::new(Settings { max_msg_size: 1024 });
+    let mut authenticator = Authenticator::new(settings());
     let mut small = [0u8; 8];
     assert_eq!(authenticator.process(&[0x04], &mut small), 1);
     assert_eq!(small[0], 0x7F);
     assert_eq!(authenticator.process(&[0x04], &mut []), 0);
+}
+
+/// §8: an authenticator accepts messages of at least 1024 bytes, so no smaller maxMsgSize can
+/// be reported.
+#[test]
+fn max_msg_size_is_at_least_1024() {
+    assert_eq!(MaxMsgSize::try_from(1023), Err(TooSmall(1023)));
+    assert_eq!(MaxMsgSize::try_from(0), Err(TooSmall(0)));
+    assert_eq!(MaxMsgSize::try_from(1024).map(MaxMsgSize::get), Ok(1024));
+    assert_eq!(MaxMsgSize::try_from(7609).map(MaxMsgSize::get), Ok(7609));
 }
 
 /// Command codes are the ones of §6; unknown codes come back as the error value.

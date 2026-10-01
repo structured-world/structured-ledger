@@ -157,6 +157,17 @@ fn indefinite_lengths_and_tags_are_refused() {
     );
 }
 
+/// A tag where a typed field is read is still a forbidden tag (§8), so it maps to
+/// CTAP2_ERR_INVALID_CBOR, not to an unexpected type; one-byte tags included.
+#[test]
+fn tags_read_as_fields_are_malformed() {
+    for tagged in [&[0xC1, 0x01][..], &[0xD7, 0x01], &[0xD8, 0x20, 0x01]] {
+        assert_eq!(Decoder::new(tagged).unsigned(), Err(Error::Malformed), "{tagged:02x?}");
+        assert_eq!(Decoder::new(tagged).text(), Err(Error::Malformed), "{tagged:02x?}");
+        assert_eq!(Decoder::new(tagged).bool(), Err(Error::Malformed), "{tagged:02x?}");
+    }
+}
+
 /// Simple values and floats are well-formed; floats keep their width (§8), so a half-precision
 /// value is canonical as it is.
 #[test]

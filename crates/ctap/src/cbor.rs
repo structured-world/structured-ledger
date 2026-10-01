@@ -167,8 +167,11 @@ impl<'a> Decoder<'a> {
         let [initial] = self.take_array::<1>()?;
         let major = Major::from_initial(initial);
         let info = initial & 0x1F;
-        if major == Major::Simple {
-            return self.simple_head(info).map(|value| (major, value));
+        match major {
+            // §8: tags MUST NOT be present, whatever the width of their number.
+            Major::Tag => return Err(Error::Malformed),
+            Major::Simple => return self.simple_head(info).map(|value| (major, value)),
+            _ => {}
         }
         let (value, minimum) = match info {
             0..=23 => return Ok((major, u64::from(info))),
@@ -190,10 +193,6 @@ impl<'a> Decoder<'a> {
         };
         if value < minimum {
             return Err(Error::NotCanonical);
-        }
-        if major == Major::Tag {
-            // §8: tags MUST NOT be present.
-            return Err(Error::Malformed);
         }
         Ok((major, value))
     }

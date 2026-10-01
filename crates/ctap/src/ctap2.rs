@@ -7,9 +7,10 @@
 //! # Examples
 //!
 //! ```
-//! use structured_passkeys_ctap::ctap2::{Authenticator, Settings, StatusCode};
+//! use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings, StatusCode};
 //!
-//! let mut authenticator = Authenticator::new(Settings { max_msg_size: 1024 });
+//! let max_msg_size = MaxMsgSize::try_from(1024).expect("at least 1024");
+//! let mut authenticator = Authenticator::new(Settings { max_msg_size });
 //! let mut response = [0u8; 128];
 //! let length = authenticator.process(&[0x04], &mut response);
 //! assert_eq!(response[0], StatusCode::Ok as u8);
@@ -187,12 +188,43 @@ impl From<cbor::Error> for StatusCode {
     }
 }
 
+/// Smallest message an authenticator must accept (§8: "authenticators MUST support messages of
+/// at least 1024 bytes").
+pub const MIN_MESSAGE_SIZE: u16 = 1024;
+
+/// Largest request the transport accepts, reported as `maxMsgSize` (§6.4); never below
+/// [`MIN_MESSAGE_SIZE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaxMsgSize(u16);
+
+/// A message size below [`MIN_MESSAGE_SIZE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooSmall(pub u16);
+
+impl TryFrom<u16> for MaxMsgSize {
+    type Error = TooSmall;
+
+    fn try_from(size: u16) -> Result<Self, TooSmall> {
+        if size >= MIN_MESSAGE_SIZE {
+            Ok(Self(size))
+        } else {
+            Err(TooSmall(size))
+        }
+    }
+}
+
+impl MaxMsgSize {
+    /// The size in bytes.
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
 /// Device facts the authenticator reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
-    /// Largest request the transport accepts, reported as `maxMsgSize` (§6.4); at least 1024
-    /// (§8).
-    pub max_msg_size: u16,
+    /// Largest request the transport accepts.
+    pub max_msg_size: MaxMsgSize,
 }
 
 /// The CTAP2 command processor.
@@ -225,8 +257,9 @@ impl Authenticator {
         match outcome {
             Ok(()) => {
                 *status = StatusCode::Ok as u8;
-                // The status byte plus the body, which lies inside `response`.
-                1 + written
+                written
+                    .checked_add(1)
+                    .expect("the body lies inside `response` after the status byte")
             }
             Err(code) => {
                 *status = code as u8;
@@ -268,8 +301,9 @@ impl Authenticator {
     }
 
     /// authenticatorGetInfo (§6.4) with the members implemented so far. `versions` stays empty
-    /// until a version's mandatory features exist: a version string is a promise platforms act
-    /// on.
+    /// until a version's command set exists and passes its conformance tests: §6.4 requires the
+    /// member but not a non-empty list, and a version string is a promise platforms act on, so
+    /// an empty list is the truthful answer rather than an error for the command.
     fn get_info(&self, encoder: &mut Encoder<'_>) -> Result<(), Full> {
         encoder
             .map(3)?
@@ -281,7 +315,7 @@ impl Authenticator {
             .bytes(&AAGUID)?
             // maxMsgSize (0x05).
             .unsigned(0x05)?
-            .unsigned(u64::from(self.settings.max_msg_size))?;
+            .unsigned(u64::from(self.settings.max_msg_size.get()))?;
         Ok(())
     }
 }
