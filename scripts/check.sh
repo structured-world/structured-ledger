@@ -27,6 +27,11 @@ run cargo clippy "${host[@]}" --all-targets -- -D warnings
 run cargo nextest run "${host[@]}"
 run cargo test --doc "${host[@]}"
 run cargo build --locked -p structured-passkeys-ctap --target thumbv7em-none-eabihf --no-default-features
+# Fuzz targets are their own workspace and run with nightly; here they only have to compile and
+# lint cleanly, while their corpus is replayed by the tests above.
+fuzz=(--manifest-path crates/ctap/fuzz/Cargo.toml)
+run cargo fmt "${fuzz[@]}" --check
+run cargo clippy --locked "${fuzz[@]}" --all-targets -- -D warnings
 
 case "$(uname -s)" in
     Linux) run scripts/device-build.sh ;;

@@ -4,6 +4,8 @@ members = ["crates/ctap", "app", "cli"]
 # The device crate only builds for Ledger targets in the dev-tools image; host
 # commands run without `-p` stay on the host crates.
 default-members = ["crates/ctap", "cli"]
+# cargo-fuzz targets build with nightly as a workspace of their own.
+exclude = ["crates/ctap/fuzz"]
 
 [workspace.package]
 version = "0.1.0"
