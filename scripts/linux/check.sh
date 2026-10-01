@@ -34,7 +34,10 @@ esac
 root=$(git rev-parse --show-toplevel)
 work=$(mktemp -d)
 ref="refs/structured-passkeys-check/snapshot-$$"
-ssh_options=(-o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=15)
+# ConnectTimeout bounds only the connection setup; the server-alive probes end a
+# session whose network went silent instead of waiting for the TCP timeout.
+ssh_options=(-o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=15
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 # Random, not the local process id: runs from different machines must not meet
 # under one name. `mkdir` below refuses an existing directory all the same.
 run_id="structured-passkeys-check-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
@@ -44,7 +47,8 @@ remote_pending=0
 
 # Removes the local snapshot and the remote directory; a failed remote removal
 # fails the run.
-# shellcheck disable=SC2329 # called by the EXIT trap
+# Older shellcheck releases report this as SC2317, newer ones as SC2329.
+# shellcheck disable=SC2317,SC2329 # called by the EXIT trap
 cleanup() {
     local rc=$?
     # The ref is absent when the run stopped before creating it.
@@ -65,7 +69,11 @@ git -C "$root" read-tree HEAD
 git -C "$root" add -A
 tree=$(git -C "$root" write-tree)
 unset GIT_INDEX_FILE
-commit=$(git -C "$root" commit-tree "$tree" -p HEAD -m "working tree snapshot")
+# The snapshot commit never leaves this run and represents no one, so it carries a
+# fixed identity: a machine without user.name/user.email must still run the gate.
+commit=$(GIT_AUTHOR_NAME=snapshot GIT_AUTHOR_EMAIL=snapshot@localhost \
+    GIT_COMMITTER_NAME=snapshot GIT_COMMITTER_EMAIL=snapshot@localhost \
+    git -C "$root" commit-tree "$tree" -p HEAD -m "working tree snapshot")
 git -C "$root" update-ref "$ref" "$commit"
 git -C "$root" bundle create "$work/snapshot.bundle" "$ref" 2>/dev/null
 

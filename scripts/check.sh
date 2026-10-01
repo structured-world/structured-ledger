@@ -11,7 +11,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # The device crate builds only for Ledger targets, so host checks leave it out.
-host=(--workspace --exclude structured-passkeys-app --all-features)
+# --locked: a manifest change without its Cargo.lock update fails here instead of
+# being resolved silently in the working tree.
+host=(--locked --workspace --exclude structured-passkeys-app --all-features)
 
 run() {
     echo "== $*"
@@ -24,7 +26,7 @@ run cargo fmt --all --check
 run cargo clippy "${host[@]}" --all-targets -- -D warnings
 run cargo nextest run "${host[@]}"
 run cargo test --doc "${host[@]}"
-run cargo build -p structured-passkeys-ctap --target thumbv7em-none-eabihf --no-default-features
+run cargo build --locked -p structured-passkeys-ctap --target thumbv7em-none-eabihf --no-default-features
 
 case "$(uname -s)" in
     Linux) run scripts/device-build.sh ;;
