@@ -7,9 +7,11 @@ use super::{
     MAX_MESSAGE_SIZE, PACKET_TIMEOUT_MS, Report, TooLong, Transport, UnknownCommand, keepalive,
 };
 
+/// CBOR and MSG enabled: INIT reports capabilities 0x04 (CBOR, MSG implemented).
 const INFO: DeviceInfo = DeviceInfo {
     version: [1, 2, 3],
-    capabilities: 0x04,
+    cbor: true,
+    msg: true,
 };
 const NONCE: [u8; 8] = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
 
@@ -628,6 +630,45 @@ fn polling_times_out_a_stalled_message() {
         Event::None,
         "its continuation is now spurious"
     );
+}
+
+/// INIT advertises exactly what the transport accepts (§11.2.9.1.3): CBOR only when enabled, MSG
+/// only when enabled (NMSG otherwise), never WINK; a command not advertised is ERR_INVALID_CMD.
+#[test]
+fn advertised_capabilities_match_the_accepted_commands() {
+    let cbor_only = DeviceInfo {
+        version: [0, 1, 0],
+        cbor: true,
+        msg: false,
+    };
+    let mut transport = Transport::<1024>::new(cbor_only);
+    let (_, _, payload) = reply(transport.receive(&init_packet(BROADCAST_CID, 0x06, 8, &NONCE), 0));
+    assert_eq!(payload[16], 0x04 | 0x08, "CBOR and NMSG, no WINK");
+    assert_eq!(
+        reply(transport.receive(&init_packet(1, 0x03, 1, &[0]), 0)),
+        error(1, 0x01)
+    );
+    cbor_request(&mut transport, 1);
+
+    let msg_only = DeviceInfo {
+        version: [0, 1, 0],
+        cbor: false,
+        msg: true,
+    };
+    let mut transport = Transport::<1024>::new(msg_only);
+    let (_, _, payload) = reply(transport.receive(&init_packet(BROADCAST_CID, 0x06, 8, &NONCE), 0));
+    assert_eq!(payload[16], 0x00, "MSG only: no flag set");
+    assert_eq!(
+        reply(transport.receive(&init_packet(1, 0x10, 1, &[0x04]), 0)),
+        error(1, 0x01)
+    );
+    assert!(matches!(
+        transport.receive(&init_packet(1, 0x03, 1, &[0]), 0),
+        Event::Request {
+            command: Command::Msg,
+            ..
+        }
+    ));
 }
 
 /// CANCEL is defined with BCNT 0 (§11.2.9.1.5): one with a payload cancels nothing, breaks no

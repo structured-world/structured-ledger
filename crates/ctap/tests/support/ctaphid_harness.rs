@@ -18,7 +18,8 @@ const STEP: usize = 2 + REPORT_SIZE;
 pub fn run(data: &[u8]) {
     let mut transport = Transport::<BUFFER>::new(structured_passkeys_ctap::ctaphid::DeviceInfo {
         version: [0, 1, 0],
-        capabilities: 0x04,
+        cbor: true,
+        msg: true,
     });
     let mut now: u64 = 0;
     let (steps, _) = data.as_chunks::<STEP>();

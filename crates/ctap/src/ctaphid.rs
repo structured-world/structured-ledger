@@ -11,7 +11,8 @@
 //!     BROADCAST_CID, Command, DeviceInfo, Event, Frames, REPORT_SIZE, Transport,
 //! };
 //!
-//! let mut transport = Transport::<1024>::new(DeviceInfo { version: [0, 1, 0], capabilities: 0 });
+//! let info = DeviceInfo { version: [0, 1, 0], cbor: true, msg: false };
+//! let mut transport = Transport::<1024>::new(info);
 //! // CTAPHID_INIT on the broadcast channel with an 8-byte nonce.
 //! let mut report = [0u8; REPORT_SIZE];
 //! report[..4].copy_from_slice(&BROADCAST_CID.to_be_bytes());
@@ -145,21 +146,46 @@ pub enum KeepaliveStatus {
     UpNeeded = 2,
 }
 
-/// What INIT reports about the device (§11.2.9.1.3).
+/// What INIT reports about the device (§11.2.9.1.3). The capability flags are derived from it, so
+/// they always match the commands the transport accepts; WINK is never claimed, since it is not
+/// implemented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
     /// Major, minor and build device version numbers (vendor defined).
     pub version: [u8; 3],
-    /// Capability flags: [`CAPABILITY_WINK`], [`CAPABILITY_CBOR`], [`CAPABILITY_NMSG`].
-    pub capabilities: u8,
+    /// `CTAPHID_CBOR` requests are accepted and CAPABILITY_CBOR is reported.
+    pub cbor: bool,
+    /// `CTAPHID_MSG` requests are accepted; otherwise CAPABILITY_NMSG is reported.
+    pub msg: bool,
 }
 
-/// The device implements `CTAPHID_WINK` (§11.2.9.1.3).
-pub const CAPABILITY_WINK: u8 = 0x01;
+impl DeviceInfo {
+    /// The capability byte of the INIT response (§11.2.9.1.3).
+    const fn capabilities(&self) -> u8 {
+        let cbor = if self.cbor { CAPABILITY_CBOR } else { 0 };
+        let nmsg = if self.msg { 0 } else { CAPABILITY_NMSG };
+        cbor | nmsg
+    }
+
+    /// Whether requests of `command` are handed to the CTAP layer.
+    const fn accepts(&self, command: Command) -> bool {
+        match command {
+            Command::Cbor => self.cbor,
+            Command::Msg => self.msg,
+            Command::Ping | Command::Init => true,
+            Command::Lock
+            | Command::Wink
+            | Command::Cancel
+            | Command::Keepalive
+            | Command::Error => false,
+        }
+    }
+}
+
 /// The device implements `CTAPHID_CBOR` (§11.2.9.1.3).
-pub const CAPABILITY_CBOR: u8 = 0x04;
+const CAPABILITY_CBOR: u8 = 0x04;
 /// The device does NOT implement `CTAPHID_MSG` (§11.2.9.1.3).
-pub const CAPABILITY_NMSG: u8 = 0x08;
+const CAPABILITY_NMSG: u8 = 0x08;
 
 /// What one received report asks the caller to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -480,15 +506,10 @@ impl<const N: usize> Transport<N> {
         report: &Report,
         now_ms: u64,
     ) -> Event<'_> {
-        match command {
-            Command::Ping | Command::Msg | Command::Cbor | Command::Init => {}
-            // Optional commands not implemented, device-to-host commands, and CANCEL (handled
-            // before any request starts).
-            Command::Lock
-            | Command::Wink
-            | Command::Keepalive
-            | Command::Error
-            | Command::Cancel => return self.error(cid, ErrorCode::InvalidCmd),
+        // Only what INIT advertises is accepted: optional commands not implemented, device-to-host
+        // commands, CANCEL (handled before any request starts) and a disabled MSG or CBOR are not.
+        if !self.info.accepts(command) {
+            return self.error(cid, ErrorCode::InvalidCmd);
         }
         if command == Command::Init && len != NONCE_LEN {
             return self.error(cid, ErrorCode::InvalidLen);
@@ -559,7 +580,7 @@ impl<const N: usize> Transport<N> {
         self.reply[8..12].copy_from_slice(&channel.to_be_bytes());
         self.reply[12] = PROTOCOL_VERSION;
         self.reply[13..16].copy_from_slice(&self.info.version);
-        self.reply[16] = self.info.capabilities;
+        self.reply[16] = self.info.capabilities();
         Event::Reply {
             cid,
             command: Command::Init,
