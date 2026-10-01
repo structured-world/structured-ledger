@@ -1,8 +1,8 @@
-//! Host companion tool for the structured-ledger device application.
+//! Host companion tool for the Structured Passkeys device application.
 
 use clap::Parser;
 
-/// Host companion for the structured-ledger FIDO2 application on Ledger devices.
+/// Host companion for the Structured Passkeys FIDO2 application on Ledger devices.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {}

@@ -27,7 +27,7 @@ case "$action" in
         files=()
         for target in nanosplus nanox stax flex apex_p; do
             release="app/target/$target/release"
-            for file in "$release"/structured-ledger-app "$release"/structured-ledger-app.{hex,apdu,sha256}; do
+            for file in "$release"/structured-passkeys-app "$release"/structured-passkeys-app.{hex,apdu,sha256}; do
                 [[ -f "$file" ]] && files+=("${file#app/target/}")
             done
         done

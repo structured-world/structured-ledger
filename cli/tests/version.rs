@@ -1,9 +1,9 @@
-//! Command-line surface of the `structured-ledger` binary.
+//! Command-line surface of the `structured-passkeys` binary.
 
 use std::process::{Command, Output};
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_structured-ledger"))
+    Command::new(env!("CARGO_BIN_EXE_structured-passkeys"))
         .args(args)
         .output()
         .expect("the binary cargo built for this test starts")
@@ -16,7 +16,7 @@ fn version_prints_name_and_manifest_version() {
     let output = run(&["--version"]);
     assert_eq!(output.status.code(), Some(0));
     // The expected version is the manifest's, not the binary's own output.
-    let expected = format!("structured-ledger {}\n", env!("CARGO_PKG_VERSION"));
+    let expected = format!("structured-passkeys {}\n", env!("CARGO_PKG_VERSION"));
     assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
     assert!(output.stderr.is_empty());
 }

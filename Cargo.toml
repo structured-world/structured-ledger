@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["structured.world"]
-repository = "https://github.com/structured-world/structured-ledger"
+repository = "https://github.com/structured-world/structured-passkeys"
 
 [workspace.lints.rust]
 missing_docs = "warn"

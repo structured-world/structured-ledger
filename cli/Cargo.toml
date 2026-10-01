@@ -1,6 +1,6 @@
 [package]
-name = "structured-ledger"
-description = "Host companion tool for the structured-ledger device application"
+name = "structured-passkeys"
+description = "Host companion tool for the Structured Passkeys device application"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

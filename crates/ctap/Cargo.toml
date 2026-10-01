@@ -1,5 +1,5 @@
 [package]
-name = "structured-ledger-ctap"
+name = "structured-passkeys-ctap"
 description = "FIDO2 / CTAP authenticator logic for Ledger devices, independent of the device SDK"
 version.workspace = true
 edition.workspace = true

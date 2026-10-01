@@ -11,7 +11,7 @@ ledger_device_sdk::set_panic!(ledger_device_sdk::exiting_panic);
 ledger_device_sdk::define_comm!(COMM);
 
 /// Name on the home screen; the same as `package.metadata.ledger.name`.
-const APP_NAME: &str = "Structured Ledger";
+const APP_NAME: &str = "Structured Passkeys";
 
 /// Class byte of the Ledger management channel; the SDK rejects other classes.
 const CLA: u8 = 0xE0;

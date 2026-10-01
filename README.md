@@ -1,4 +1,4 @@
-# structured-ledger
+# Structured Passkeys
 
 A FIDO2 / passkey authenticator application for Ledger devices, written in Rust.
 
@@ -17,9 +17,9 @@ A FIDO2 / passkey authenticator application for Ledger devices, written in Rust.
 
 | Path | Crate | Role |
 |---|---|---|
-| `crates/ctap` | `structured-ledger-ctap` | Protocol logic, `no_std` with `alloc`, tested on the host |
-| `app` | `structured-ledger-app` | Device application on the Ledger Rust SDK |
-| `cli` | `structured-ledger` | Host companion tool |
+| `crates/ctap` | `structured-passkeys-ctap` | Protocol logic, `no_std` with `alloc`, tested on the host |
+| `app` | `structured-passkeys-app` | Device application on the Ledger Rust SDK |
+| `cli` | `structured-passkeys` | Host companion tool |
 
 ## Building
 
@@ -29,7 +29,7 @@ pins:
 
 ```sh
 scripts/device-build.sh                                                   # Linux with Docker
-STRUCTURED_LEDGER_LINUX=<ssh destination> scripts/linux/check.sh device   # elsewhere, through a Linux host
+STRUCTURED_PASSKEYS_LINUX=<ssh destination> scripts/linux/check.sh device   # elsewhere, through a Linux host
 ```
 
 The single check that every change must pass:
@@ -45,8 +45,8 @@ accepts only applications signed by Ledger. With the device unlocked and on its 
 
 ```sh
 uvx --from ledgerblue python -m ledgerblue.runScript --scp \
-  --fileName target/device/apex_p/release/structured-ledger-app.apdu \
-  --elfFile target/device/apex_p/release/structured-ledger-app
+  --fileName target/device/apex_p/release/structured-passkeys-app.apdu \
+  --elfFile target/device/apex_p/release/structured-passkeys-app
 uvx --from ledgerwallet ledgerctl list
 ```
 
@@ -56,3 +56,6 @@ they are under `app/target/` instead.
 ## License
 
 Apache-2.0, see [LICENSE](LICENSE).
+
+Ledger, Ledger Nano, Ledger Stax and Ledger Flex are trademarks of Ledger SAS. This project is
+independent and not affiliated with or endorsed by Ledger.

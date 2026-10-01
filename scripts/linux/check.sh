@@ -2,7 +2,7 @@
 # Runs the checks that need Ledger's Linux dev-tools image on the project's
 # Linux check host over SSH, without pushing anything.
 #
-#   STRUCTURED_LEDGER_LINUX=<ssh destination> scripts/linux/check.sh device
+#   STRUCTURED_PASSKEYS_LINUX=<ssh destination> scripts/linux/check.sh device
 #
 # `device` builds and lints the device application for every target
 # (scripts/device-build.sh) and copies the artifacts back into
@@ -17,10 +17,10 @@
 # shared. The dev-tools image itself stays: it is a tool the host keeps, like a
 # toolchain.
 #
-# STRUCTURED_LEDGER_LINUX is an SSH destination that can run docker.
+# STRUCTURED_PASSKEYS_LINUX is an SSH destination that can run docker.
 set -euo pipefail
 
-destination="${STRUCTURED_LEDGER_LINUX:?set STRUCTURED_LEDGER_LINUX to the SSH destination of the Linux check host}"
+destination="${STRUCTURED_PASSKEYS_LINUX:?set STRUCTURED_PASSKEYS_LINUX to the SSH destination of the Linux check host}"
 action="${1:?action: device}"
 
 case "$action" in
@@ -33,11 +33,11 @@ esac
 
 root=$(git rev-parse --show-toplevel)
 work=$(mktemp -d)
-ref="refs/structured-ledger-check/snapshot-$$"
+ref="refs/structured-passkeys-check/snapshot-$$"
 ssh_options=(-o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=15)
 # Random, not the local process id: runs from different machines must not meet
 # under one name. `mkdir` below refuses an existing directory all the same.
-run_id="structured-ledger-check-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+run_id="structured-passkeys-check-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 remote_dir="/tmp/$run_id"
 # Set while the remote directory may exist.
 remote_pending=0
