@@ -1,0 +1,23 @@
+[package]
+name = "structured-passkeys-ctap-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# cargo-fuzz builds with nightly and its own flags, so the fuzz crate is a workspace of its own.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+structured-passkeys-ctap = { path = ".." }
+
+[[bin]]
+name = "ctaphid"
+path = "fuzz_targets/ctaphid.rs"
+test = false
+doc = false
+bench = false
