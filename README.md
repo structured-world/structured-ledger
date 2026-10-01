@@ -38,10 +38,18 @@ The single check that every change must pass:
 scripts/check.sh
 ```
 
+## Releases
+
+Every release on GitHub carries, per device, the ELF, the `.hex`, the `.apdu` to load and a
+`.sha256` with the application hash the device shows at installation, plus `SHA256SUMS` for the
+downloads. Versions, tags and `CHANGELOG.md` come from conventional commits through a release
+pull request.
+
 ## Loading onto a device
 
 Nano S Plus, Stax, Flex and Nano Gen5 accept the application after an on-device warning; the Nano X
-accepts only applications signed by Ledger. With the device unlocked and on its dashboard:
+accepts only applications signed by Ledger. With the device unlocked and on its dashboard, from a
+release (`structured-passkeys-<tag>-<device>.apdu` and `.elf`) or a local build:
 
 ```sh
 uvx --from ledgerblue python -m ledgerblue.runScript --scp \

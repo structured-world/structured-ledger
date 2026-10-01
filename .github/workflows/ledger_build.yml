@@ -22,3 +22,6 @@ jobs:
     with:
       upload_app_binaries_artifact: structured_passkeys_binaries
       builder: ledger-app-builder
+      # Pull requests also build the target branch and get a comment with the ELF section and
+      # stack sizes per device against it.
+      build_comparison: true

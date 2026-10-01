@@ -22,6 +22,8 @@ run() {
 
 run scripts/check-links.sh
 run shellcheck scripts/*.sh scripts/linux/*.sh
+# Workflow syntax and expressions, and shellcheck on their `run:` blocks.
+run actionlint
 run cargo fmt --all --check
 run cargo clippy "${host[@]}" --all-targets -- -D warnings
 run cargo nextest run "${host[@]}"
