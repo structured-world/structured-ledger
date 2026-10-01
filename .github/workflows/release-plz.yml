@@ -1,9 +1,10 @@
 name: Release-plz
 
 # Keeps the release pull request (version bump and CHANGELOG entry from conventional commits)
-# and, when it is merged, tags vX.Y.Z and creates the GitHub release. The release bot's token is
-# used instead of GITHUB_TOKEN, because pull requests and releases created with GITHUB_TOKEN do
-# not start the checks and the release-assets workflow.
+# and, when it is merged, tags vX.Y.Z, creates the GitHub release as a draft and runs the
+# release-assets workflow, which attaches the device files and publishes it. The release bot's
+# token is used instead of GITHUB_TOKEN, because a pull request opened with GITHUB_TOKEN does not
+# start the required checks.
 
 on:
   push:
@@ -55,6 +56,8 @@ jobs:
     # runs cannot race for the tag: with release_always = false, release-plz releases only when
     # the commit it runs on belongs to a release-plz-* pull request, and then tags that pull
     # request's last commit; a run on any later commit skips the release.
+    outputs:
+      tag: ${{ steps.released.outputs.tag }}
     steps:
       - name: Release bot token
         id: app-token
@@ -73,8 +76,30 @@ jobs:
       - name: Rust toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - name: Tag and release
+        id: release
         uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      # Only the application is released (release-plz.toml), so there is one release at most.
+      - name: Released tag
+        id: released
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: echo "tag=$(jq -r '.[0].tag' <<< "${RELEASES}")" >> "${GITHUB_OUTPUT}"
+
+  # The release is a draft, and GitHub starts no workflow on draft release events, so the assets
+  # are built from here; that workflow attaches them and publishes the draft.
+  assets:
+    name: Release assets
+    needs: release
+    if: needs.release.outputs.tag != ''
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+    uses: ./.github/workflows/release-assets.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}

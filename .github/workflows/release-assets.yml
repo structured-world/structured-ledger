@@ -1,15 +1,19 @@
 name: Release assets
 
-# Builds every device of ledger_app.toml with Ledger's reusable build for a new release and
-# attaches the installable files to it. release-plz creates the release as a draft, and the draft
-# is published only after its files are attached: a published release never lacks them, and
-# immutable releases (whose assets cannot change after publication) keep working. Can be run by
-# hand for an existing tag; a tag without a release gets a pre-release the same way.
+# Builds every device of ledger_app.toml with Ledger's reusable build for a release and attaches
+# the installable files to it. release-plz creates the release as a draft and calls this workflow
+# (GitHub starts no workflow on events of a draft release); the draft is published only after its
+# files are attached, so a published release never lacks them and immutable releases (whose
+# assets cannot change after publication) keep working. Can be run by hand for an existing tag; a
+# tag without a release gets a pre-release the same way.
 
 on:
-  release:
-    types:
-      - created
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to build (vX.Y.Z or vX.Y.Z-suffix)
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -27,7 +31,7 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       commit: ${{ steps.tag.outputs.commit }}
     env:
-      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG: ${{ inputs.tag }}
     steps:
       # Qualified, so a branch with the same name is never taken for the tag; the build then gets
       # the tag's commit, not a name it would resolve again.
