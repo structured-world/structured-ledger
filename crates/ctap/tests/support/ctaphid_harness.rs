@@ -2,7 +2,9 @@
 //! test of its corpus.
 //!
 //! The input is a sequence of 66-byte steps: a time step in milliseconds, a flag byte, then one
-//! 64-byte report. Every event is checked against the invariants the device relies on.
+//! 64-byte report. Flag bit 0 finishes a request handed out by the step, bit 1 turns the step
+//! into a timer poll without a report. Every event is checked against the invariants the device
+//! relies on.
 
 use structured_passkeys_ctap::ctaphid::{Command, Event, Frames, REPORT_SIZE, Report, Transport};
 
@@ -23,6 +25,19 @@ pub fn run(data: &[u8]) {
     for step in steps {
         now += u64::from(step[0]);
         let finish_after = step[1] & 1 == 1;
+        if step[1] & 2 == 2 {
+            // A poll only ever reports a timeout, and only to the channel whose message stalled.
+            match transport.poll(now) {
+                Event::None => {}
+                Event::Reply {
+                    command: Command::Error,
+                    payload: [0x05],
+                    ..
+                } => {}
+                other => panic!("poll returned {other:?}"),
+            }
+            continue;
+        }
         let mut report: Report = [0; REPORT_SIZE];
         report.copy_from_slice(&step[2..]);
         let active_before = transport.active();

@@ -4,7 +4,7 @@
 
 use super::{
     BROADCAST_CID, Command, DeviceInfo, ErrorCode, Event, Frames, KeepaliveStatus,
-    MAX_MESSAGE_SIZE, PACKET_TIMEOUT_MS, Report, TooLong, Transport, keepalive,
+    MAX_MESSAGE_SIZE, PACKET_TIMEOUT_MS, Report, TooLong, Transport, UnknownCommand, keepalive,
 };
 
 const INFO: DeviceInfo = DeviceInfo {
@@ -57,7 +57,7 @@ fn with_channels<const N: usize>(count: u32) -> Transport<N> {
     transport
 }
 
-/// Sends a CBOR request of `len` bytes on `cid` that fits one packet and returns its payload.
+/// Sends a one-byte CBOR request on `cid` and checks it is handed out.
 fn cbor_request<const N: usize>(transport: &mut Transport<N>, cid: u32) {
     match transport.receive(&init_packet(cid, 0x10, 1, &[0x04]), 0) {
         Event::Request {
@@ -471,7 +471,7 @@ fn command_codes_follow_the_specification() {
         assert_eq!(Command::try_from(code), Ok(command));
         assert_eq!(command as u8, code);
     }
-    assert_eq!(Command::try_from(0x02), Err(0x02));
+    assert_eq!(Command::try_from(0x02), Err(UnknownCommand(0x02)));
     assert_eq!(ErrorCode::InvalidChannel as u8, 0x0B);
     assert_eq!(ErrorCode::LockRequired as u8, 0x0A);
 }
@@ -544,4 +544,115 @@ fn keepalive_carries_the_status() {
     expected[..8].copy_from_slice(&[0, 0, 0, 7, 0xBB, 0x00, 0x01, 0x02]);
     assert_eq!(keepalive(7, KeepaliveStatus::UpNeeded), expected);
     assert_eq!(keepalive(7, KeepaliveStatus::Processing)[7], 0x01);
+}
+
+/// Request bytes (possibly PIN/UV material) leave the buffer when the request ends: answered,
+/// aborted by INIT, broken by a sequence error, timed out, or echoed by PING.
+#[test]
+fn request_bytes_are_wiped_when_the_request_ends() {
+    let secret = [0x5Au8; 57];
+    let wiped = |transport: &Transport<1024>| transport.buffer.iter().all(|&byte| byte == 0);
+
+    let mut answered = with_channels::<1024>(1);
+    assert!(matches!(
+        answered.receive(&init_packet(1, 0x10, 57, &secret), 0),
+        Event::Request { .. }
+    ));
+    answered.finish();
+    assert!(wiped(&answered), "finished request");
+
+    let mut aborted = with_channels::<1024>(1);
+    assert!(matches!(
+        aborted.receive(&init_packet(1, 0x10, 57, &secret), 0),
+        Event::Request { .. }
+    ));
+    reply(aborted.receive(&init_packet(1, 0x06, 8, &NONCE), 0));
+    assert!(
+        aborted.buffer[NONCE.len()..].iter().all(|&byte| byte == 0),
+        "INIT abort"
+    );
+
+    let mut broken = with_channels::<1024>(1);
+    assert_eq!(
+        broken.receive(&init_packet(1, 0x10, 200, &secret), 0),
+        Event::None
+    );
+    reply(broken.receive(&cont_packet(1, 3, &[0; 59]), 0));
+    assert!(wiped(&broken), "sequence error");
+
+    let mut stalled = with_channels::<1024>(1);
+    assert_eq!(
+        stalled.receive(&init_packet(1, 0x10, 200, &secret), 0),
+        Event::None
+    );
+    reply(stalled.poll(PACKET_TIMEOUT_MS));
+    assert!(wiped(&stalled), "timeout");
+
+    let mut echoed = with_channels::<1024>(1);
+    reply(echoed.receive(&init_packet(1, 0x01, 57, &secret), 0));
+    assert_eq!(echoed.poll(0), Event::None);
+    assert!(wiped(&echoed), "PING echo, wiped on the next call");
+}
+
+/// An unknown command on channel 0, the broadcast channel or an unallocated channel is
+/// ERR_INVALID_CHANNEL like any other command there: the channel is checked first (§11.2.3).
+#[test]
+fn unknown_commands_on_invalid_channels_are_invalid_channel() {
+    let mut transport = with_channels::<1024>(1);
+    for cid in [0, BROADCAST_CID, 5] {
+        assert_eq!(
+            reply(transport.receive(&init_packet(cid, 0x02, 0, &[]), 0)),
+            error(cid, 0x0B),
+            "channel {cid:#x}"
+        );
+    }
+}
+
+/// A stalled message times out at its deadline without another report: polling gives the
+/// channel ERR_MSG_TIMEOUT and frees the device (§11.2.5.2).
+#[test]
+fn polling_times_out_a_stalled_message() {
+    let mut transport = with_channels::<1024>(1);
+    assert_eq!(
+        transport.receive(&init_packet(1, 0x01, 200, &[0; 57]), 1000),
+        Event::None
+    );
+    assert_eq!(transport.poll(1000 + PACKET_TIMEOUT_MS - 1), Event::None);
+    assert_eq!(
+        reply(transport.poll(1000 + PACKET_TIMEOUT_MS)),
+        error(1, 0x05)
+    );
+    assert_eq!(transport.poll(5000), Event::None, "reported once");
+    assert_eq!(
+        transport.receive(&cont_packet(1, 0, &[0; 59]), 5000),
+        Event::None,
+        "its continuation is now spurious"
+    );
+}
+
+/// CANCEL is defined with BCNT 0 (§11.2.9.1.5): one with a payload cancels nothing, breaks no
+/// message and, like every CANCEL, is not answered.
+#[test]
+fn cancel_with_a_payload_is_ignored() {
+    let mut transport = with_channels::<1024>(1);
+    cbor_request(&mut transport, 1);
+    assert_eq!(
+        transport.receive(&init_packet(1, 0x11, 1, &[0]), 0),
+        Event::None
+    );
+    assert_eq!(transport.active(), Some(1));
+    transport.finish();
+
+    assert_eq!(
+        transport.receive(&init_packet(1, 0x01, 60, &[3; 57]), 0),
+        Event::None
+    );
+    assert_eq!(
+        transport.receive(&init_packet(1, 0x11, 2, &[0, 0]), 0),
+        Event::None
+    );
+    assert_eq!(
+        reply(transport.receive(&cont_packet(1, 0, &[3; 3]), 0)),
+        (1, Command::Ping, vec![3; 60])
+    );
 }

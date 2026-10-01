@@ -26,6 +26,8 @@
 //! assert_eq!(reports.len(), 1);
 //! ```
 
+use zeroize::Zeroize;
+
 /// Size of a CTAPHID report in bytes (§11.2.8.1, full-speed endpoints).
 pub const REPORT_SIZE: usize = 64;
 
@@ -85,12 +87,15 @@ pub enum Command {
     Error = 0x3F,
 }
 
-impl TryFrom<u8> for Command {
-    type Error = u8;
+/// A command code that §11.2.9 does not define.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownCommand(pub u8);
 
-    /// Reads a command code without the initialization-packet bit; an unknown code is returned
-    /// as the error.
-    fn try_from(code: u8) -> Result<Self, u8> {
+impl TryFrom<u8> for Command {
+    type Error = UnknownCommand;
+
+    /// Reads a command code without the initialization-packet bit.
+    fn try_from(code: u8) -> Result<Self, UnknownCommand> {
         Ok(match code {
             0x01 => Command::Ping,
             0x03 => Command::Msg,
@@ -101,7 +106,7 @@ impl TryFrom<u8> for Command {
             0x11 => Command::Cancel,
             0x3B => Command::Keepalive,
             0x3F => Command::Error,
-            other => return Err(other),
+            other => return Err(UnknownCommand(other)),
         })
     }
 }
@@ -214,10 +219,18 @@ enum State {
 /// at most [`MAX_MESSAGE_SIZE`].
 pub struct Transport<const N: usize> {
     buffer: [u8; N],
+    /// Leading bytes of `buffer` that may still hold request data.
+    dirty: usize,
     reply: [u8; INIT_RESPONSE_LEN],
     state: State,
     last_cid: u32,
     info: DeviceInfo,
+}
+
+impl<const N: usize> Drop for Transport<N> {
+    fn drop(&mut self) {
+        self.wipe();
+    }
 }
 
 impl<const N: usize> Transport<N> {
@@ -228,11 +241,56 @@ impl<const N: usize> Transport<N> {
         let () = Self::SIZE_IN_RANGE;
         Self {
             buffer: [0; N],
+            dirty: 0,
             reply: [0; INIT_RESPONSE_LEN],
             state: State::Idle,
             last_cid: 0,
             info,
         }
+    }
+
+    /// Zeroes the request bytes held in the buffer: a request can carry PIN/UV material.
+    fn wipe(&mut self) {
+        self.buffer[..self.dirty].zeroize();
+        self.dirty = 0;
+    }
+
+    /// Ends the current transaction and wipes its data.
+    fn reset(&mut self) {
+        self.state = State::Idle;
+        self.wipe();
+    }
+
+    /// Records that the first `end` bytes of the buffer now hold request data.
+    fn mark_dirty(&mut self, end: usize) {
+        self.dirty = self.dirty.max(end);
+    }
+
+    /// A broken internal invariant: the transaction is dropped and the channel told so.
+    fn broken(&mut self, cid: u32) -> Event<'_> {
+        self.reset();
+        self.error(cid, ErrorCode::Other)
+    }
+
+    /// Abandons a message whose next packet is late (§11.2.5.2) and returns its channel.
+    fn expire(&mut self, now_ms: u64) -> Option<u32> {
+        let State::Assembling {
+            cid,
+            last_packet_ms,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
+        // A clock that went backwards abandons the message too: its age is unknown.
+        let expired = now_ms
+            .checked_sub(last_packet_ms)
+            .is_none_or(|age| age >= PACKET_TIMEOUT_MS);
+        if !expired {
+            return None;
+        }
+        self.reset();
+        Some(cid)
     }
 
     /// Largest request accepted, in bytes.
@@ -249,33 +307,37 @@ impl<const N: usize> Transport<N> {
         }
     }
 
-    /// Marks the request of [`Transport::active`] as answered; the device becomes idle.
+    /// Marks the request of [`Transport::active`] as answered; the device becomes idle and the
+    /// request bytes are wiped.
     pub fn finish(&mut self) {
         if matches!(self.state, State::Processing { .. }) {
-            self.state = State::Idle;
+            self.reset();
+        }
+    }
+
+    /// Called by the device loop without a report, at least as often as keepalives are sent:
+    /// times out a stalled message at its deadline (§11.2.5.2) and wipes the data of a reply
+    /// already sent.
+    pub fn poll(&mut self, now_ms: u64) -> Event<'_> {
+        if self.state == State::Idle {
+            self.wipe();
+        }
+        match self.expire(now_ms) {
+            Some(cid) => self.error(cid, ErrorCode::MsgTimeout),
+            None => Event::None,
         }
     }
 
     /// Handles one report received at `now_ms` (a monotonic millisecond clock).
     pub fn receive(&mut self, report: &Report, now_ms: u64) -> Event<'_> {
         let cid = u32::from_be_bytes([report[0], report[1], report[2], report[3]]);
-        if let State::Assembling {
-            cid: active,
-            last_packet_ms,
-            ..
-        } = self.state
-        {
-            // A clock that went backwards abandons the request too: its age is unknown.
-            let expired = now_ms
-                .checked_sub(last_packet_ms)
-                .is_none_or(|age| age >= PACKET_TIMEOUT_MS);
-            if expired {
-                self.state = State::Idle;
-                // §11.2.5.2: the late packet of the abandoned request learns why.
-                if cid == active && report[4] & INIT_BIT == 0 {
-                    return self.error(cid, ErrorCode::MsgTimeout);
-                }
-            }
+        if self.state == State::Idle {
+            // The previous reply (a PING echo) has been sent by now.
+            self.wipe();
+        }
+        // §11.2.5.2: the late packet of an abandoned message learns why.
+        if self.expire(now_ms) == Some(cid) && report[4] & INIT_BIT == 0 {
+            return self.error(cid, ErrorCode::MsgTimeout);
         }
         if report[4] & INIT_BIT == 0 {
             self.continuation(cid, report, now_ms)
@@ -304,21 +366,36 @@ impl<const N: usize> Transport<N> {
         }
         let seq = report[4];
         if seq != next_seq {
-            self.state = State::Idle;
+            self.reset();
             return self.error(cid, ErrorCode::InvalidSeq);
         }
-        // `len - filled` is positive while assembling, and at most one packet's worth is taken.
-        let take = (len - filled).min(CONT_DATA);
-        self.buffer[filled..filled + take].copy_from_slice(&report[5..5 + take]);
-        let filled = filled + take;
-        if filled < len {
+        // `filled < len <= N` while assembling; a violation drops the message instead of
+        // wrapping or panicking on host-driven offsets.
+        let Some(remaining) = len.checked_sub(filled) else {
+            return self.broken(cid);
+        };
+        let take = remaining.min(CONT_DATA);
+        let Some(end) = filled.checked_add(take) else {
+            return self.broken(cid);
+        };
+        let (Some(target), Some(source)) =
+            (self.buffer.get_mut(filled..end), report.get(5..5 + take))
+        else {
+            return self.broken(cid);
+        };
+        target.copy_from_slice(source);
+        self.mark_dirty(end);
+        if end < len {
+            // A message of at most N <= MAX_MESSAGE_SIZE bytes ends by sequence MAX_SEQ.
+            let Some(next_seq) = seq.checked_add(1).filter(|next| *next <= MAX_SEQ) else {
+                return self.broken(cid);
+            };
             self.state = State::Assembling {
                 cid,
                 command,
                 len,
-                filled,
-                // A message of at most N <= MAX_MESSAGE_SIZE bytes ends by sequence MAX_SEQ.
-                next_seq: seq + 1,
+                filled: end,
+                next_seq,
                 last_packet_ms: now_ms,
             };
             return Event::None;
@@ -332,13 +409,20 @@ impl<const N: usize> Transport<N> {
         let len = usize::from(u16::from_be_bytes([report[5], report[6]]));
         let command = Command::try_from(code);
 
+        // §11.2.9.1.5 defines CANCEL with BCNT 0; one with a payload is not that request and is
+        // ignored in every state. No CANCEL is ever answered.
+        let cancel = command == Ok(Command::Cancel);
+        if cancel && len != 0 {
+            return Event::None;
+        }
+
         match self.state {
             State::Processing { cid: active } if cid == active => {
                 return match command {
                     Ok(Command::Cancel) => Event::Cancel { cid },
                     // §11.2.5.3: INIT on the active channel aborts its transaction.
                     Ok(Command::Init) => {
-                        self.state = State::Idle;
+                        self.reset();
                         self.start(cid, Command::Init, len, report, now_ms)
                     }
                     // The channel's own request is still being processed.
@@ -346,19 +430,18 @@ impl<const N: usize> Transport<N> {
                 };
             }
             State::Assembling { cid: active, .. } if cid == active => {
-                // §11.2.5.3: INIT resynchronizes the channel; any other initialization packet
-                // breaks the message being assembled.
-                self.state = State::Idle;
+                // §11.2.5.3: INIT resynchronizes the channel; CANCEL gives the message up; any
+                // other initialization packet breaks the message being assembled.
+                self.reset();
                 match command {
                     Ok(Command::Init) => {}
-                    // §11.2.9.1.5: CANCEL is never answered; the client gave the message up.
                     Ok(Command::Cancel) => return Event::None,
                     _ => return self.error(cid, ErrorCode::InvalidSeq),
                 }
             }
             State::Processing { .. } | State::Assembling { .. } => {
                 // §11.2.9.1.5: CANCEL on a non-active channel is ignored.
-                if command == Ok(Command::Cancel) {
+                if cancel {
                     return Event::None;
                 }
                 // §11.2.5.1: a request from another channel fails immediately.
@@ -367,13 +450,28 @@ impl<const N: usize> Transport<N> {
             State::Idle => {}
         }
 
+        // §11.2.9.1.5: CANCEL with nothing to cancel is ignored, on any channel.
+        if cancel {
+            return Event::None;
+        }
+        // §11.2.3: channel 0 is reserved, the broadcast channel only allocates, and any other
+        // channel must have been allocated. Checked before the command, so an unknown command
+        // there is still an invalid channel.
+        let valid_channel = match cid {
+            0 => false,
+            BROADCAST_CID => command == Ok(Command::Init),
+            _ => cid <= self.last_cid,
+        };
+        if !valid_channel {
+            return self.error(cid, ErrorCode::InvalidChannel);
+        }
         match command {
             Ok(command) => self.start(cid, command, len, report, now_ms),
-            Err(_) => self.error(cid, ErrorCode::InvalidCmd),
+            Err(UnknownCommand(_)) => self.error(cid, ErrorCode::InvalidCmd),
         }
     }
 
-    /// Validates the first packet of a request on an idle device and starts or completes it.
+    /// Starts or completes a request on an idle device, on a channel already checked.
     fn start(
         &mut self,
         cid: u32,
@@ -382,23 +480,10 @@ impl<const N: usize> Transport<N> {
         report: &Report,
         now_ms: u64,
     ) -> Event<'_> {
-        // §11.2.9.1.5: CANCEL with nothing to cancel is ignored, on any channel.
-        if command == Command::Cancel {
-            return Event::None;
-        }
-        // §11.2.3: channel 0 is reserved, the broadcast channel only allocates, and any other
-        // channel must have been allocated.
-        let valid_channel = match cid {
-            0 => false,
-            BROADCAST_CID => command == Command::Init,
-            _ => cid <= self.last_cid,
-        };
-        if !valid_channel {
-            return self.error(cid, ErrorCode::InvalidChannel);
-        }
         match command {
             Command::Ping | Command::Msg | Command::Cbor | Command::Init => {}
-            // Optional commands not implemented, and device-to-host commands.
+            // Optional commands not implemented, device-to-host commands, and CANCEL (handled
+            // before any request starts).
             Command::Lock
             | Command::Wink
             | Command::Keepalive
@@ -411,8 +496,10 @@ impl<const N: usize> Transport<N> {
         if len > N {
             return self.error(cid, ErrorCode::InvalidLen);
         }
+        // At most INIT_DATA bytes, which N is at least.
         let take = len.min(INIT_DATA);
         self.buffer[..take].copy_from_slice(&report[7..7 + take]);
+        self.mark_dirty(take);
         if take < len {
             self.state = State::Assembling {
                 cid,
@@ -548,11 +635,15 @@ impl Iterator for Frames<'_> {
                 debug_assert!(seq <= MAX_SEQ, "payload bounded by MAX_MESSAGE_SIZE");
                 report[4] = seq;
                 let take = (self.payload.len() - self.offset).min(CONT_DATA);
-                report[5..5 + take].copy_from_slice(&self.payload[self.offset..self.offset + take]);
-                self.offset += take;
+                let end = self
+                    .offset
+                    .checked_add(take)
+                    .expect("offset + take stays within the payload length");
+                report[5..5 + take].copy_from_slice(&self.payload[self.offset..end]);
+                self.offset = end;
                 // A payload of at most MAX_MESSAGE_SIZE ends by sequence MAX_SEQ (0x7F), so the
                 // next value is at most 0x80 and is never written: the payload is exhausted.
-                self.seq = Some(seq + 1);
+                self.seq = Some(seq.checked_add(1).expect("sequence is at most MAX_SEQ"));
             }
         }
         Some(report)
