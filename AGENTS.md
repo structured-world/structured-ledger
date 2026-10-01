@@ -7,6 +7,12 @@ Rules a change in this repository must meet. Reviewers check them; the gate scri
 
 - Every behavior decided by a specification (CTAP 2.1/2.2, WebAuthn L3, CBOR) carries a code
   comment naming the specification and section.
+- Where the specification leaves a choice open (a timeout value, an optional command), the comment
+  states the choice and why.
+- A MUST or MUST NOT holds on every path, error paths included: a message the specification says is
+  never answered gets no reply even when it is malformed or arrives in an unexpected state.
+- Input is validated in the order the specification layers it (channel before command, length
+  before buffering), so a message that fails an outer check never reaches an inner one.
 - The pull request description states the scope and acceptance checks of the change; a behavior
   change without them is incomplete.
 
@@ -18,11 +24,16 @@ Rules a change in this repository must meet. Reviewers check them; the gate scri
 - Untrusted input (CTAPHID packets, CBOR, credential IDs, backup blobs) is bounded by the received
   length; no allocation sized by a field the attacker controls beyond that.
 - Secrets (derived keys, private keys, CredRandom, PIN material) live in RAM only for the command
-  that needs them and are zeroised on every exit path, including errors.
+  that needs them and are zeroised on every exit path, including errors and drop. Buffers that
+  receive host requests count: a request can carry PIN/UV material. Zeroise with the `zeroize`
+  crate, never with a plain fill the compiler may remove.
 - No `unwrap` outside tests; `expect` only for internal invariants with the invariant stated.
 - Arithmetic: `checked_*` with explicit handling; `saturating_*` only where clamping is the specified
-  behavior, with a comment saying so.
-- Typed errors in libraries; every CTAP failure maps to a specified status code.
+  behavior, with a comment saying so. On values derived from host input a failed check drops the
+  message with a protocol error, never a panic; on values the device produced itself, `expect`
+  names the invariant that rules the failure out.
+- Typed errors in libraries, `TryFrom` conversions included (no primitive error types); every CTAP
+  failure maps to a specified status code.
 - Comments explain the code under them in one or two sentences; no plans, history or issue numbers
   (a specification reference is the exception).
 
@@ -33,7 +44,16 @@ Rules a change in this repository must meet. Reviewers check them; the gate scri
 - Each test states what it checks. Expected values come from specification vectors or an independent
   computation, never from the code under test.
 - A bug fix starts with a test that fails without the fix.
+- A fuzz harness asserts the protocol's MUST and MUST NOT rules, not only the absence of panics. Its
+  minimized corpus is committed and replayed by the test suite on stable.
 - `cargo nextest run` for Rust tests; `cargo test --doc` for doc tests.
+
+## Scripts and CI
+
+- Scripts run on a clean machine: no git identity, no global configuration, nothing outside the
+  repository assumed. Cargo commands in the gate use `--locked`.
+- Tools whose verdicts change between versions (shellcheck, linters) are pinned in CI to the version
+  the gate uses locally; GitHub Actions are pinned by commit SHA.
 
 ## Commits and pull requests
 

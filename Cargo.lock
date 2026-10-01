@@ -590,6 +590,9 @@ dependencies = [
 [[package]]
 name = "structured-passkeys-ctap"
 version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "syn"
