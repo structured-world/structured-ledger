@@ -22,8 +22,20 @@ jobs:
         run: rustup toolchain install
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
-          # shellcheck and actionlint pinned: rule codes change between releases, and the gate
-          # must judge the same way here and on a workstation.
-          tool: cargo-nextest,lychee,shellcheck@0.11.0,actionlint@1.7.12
+          # shellcheck pinned: rule codes change between releases, and the gate must judge the
+          # same way here and on a workstation.
+          tool: cargo-nextest,lychee,shellcheck@0.11.0
+      # Pinned for the same reason; install-action does not carry actionlint, so the release
+      # archive is fetched and checked against its published SHA-256.
+      - name: actionlint 1.7.12
+        run: |
+          archive=actionlint_1.7.12_linux_amd64.tar.gz
+          curl -sSfL -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/${archive}"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${RUNNER_TEMP}/${archive}" \
+            | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/bin" actionlint
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
       - name: Gate
         run: scripts/check.sh
