@@ -23,5 +23,7 @@ jobs:
       upload_app_binaries_artifact: structured_passkeys_binaries
       builder: ledger-app-builder
       # Pull requests also build the target branch and get a comment with the ELF section and
-      # stack sizes per device against it.
+      # stack sizes per device against it. A pull request from a fork has a read-only token, so
+      # it gets no comment; the table is still in the job log, and the comment step runs with
+      # continue-on-error, so the check does not fail.
       build_comparison: true
