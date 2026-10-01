@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Ledger's checks require the newest ledger_device_sdk; daily keeps the gap short.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+  # Actions are pinned by commit SHA; this keeps the pins current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

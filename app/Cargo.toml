@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-ledger_device_sdk = { version = "1.37.1", features = ["io_new", "nano_nbgl"] }
+ledger_device_sdk = { version = "1.38.0", features = ["io_new", "nano_nbgl"] }
 
 # Read by the SDK build script into the install parameters of the binary. Icon paths are
 # relative to this directory.
