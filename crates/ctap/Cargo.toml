@@ -1,0 +1,17 @@
+[package]
+name = "structured-passkeys-ctap"
+description = "FIDO2 / CTAP authenticator logic for Ledger devices, independent of the device SDK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = ["std"]
+# Host users; the device build uses `--no-default-features`.
+std = []
+
+[lints]
+workspace = true

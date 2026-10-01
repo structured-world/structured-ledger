@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/ctap", "app", "cli"]
+# The device crate only builds for Ledger targets in the dev-tools image; host
+# commands run without `-p` stay on the host crates.
+default-members = ["crates/ctap", "cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["structured.world"]
+repository = "https://github.com/structured-world/structured-passkeys"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+# Device crates select code by the Ledger SDK's custom target_os values.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("nanosplus", "nanox", "stax", "flex", "apex_p"))'] }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"

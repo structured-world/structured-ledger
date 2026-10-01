@@ -1,0 +1,14 @@
+# Device builds run from this directory in the Ledger dev-tools image.
+
+[build]
+# The SDK build script resolves icon paths against the parent of the target directory and
+# Ledger's checks resolve them against this directory, so the target directory lives here.
+target-dir = "target"
+
+[profile.release]
+opt-level = "z"
+lto = true
+
+[unstable]
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
