@@ -155,6 +155,8 @@ pub enum StatusCode {
     PuatRequired = 0x36,
     /// PIN policy violation.
     PinPolicyViolation = 0x37,
+    // 0x38 is "Reserved for Future Use" in §8.2; an expired pinUvAuthToken is
+    // CTAP2_ERR_PIN_AUTH_INVALID (§6.5), not a code of its own.
     /// The request is too large for the authenticator.
     RequestTooLarge = 0x39,
     /// The current operation timed out.

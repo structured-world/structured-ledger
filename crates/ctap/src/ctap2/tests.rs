@@ -2,8 +2,7 @@
 //! written out byte by byte, never produced by the code under test.
 
 use super::{
-    AAGUID, Authenticator, CommandCode, MaxMsgSize, Settings, StatusCode, TooSmall,
-    UnknownCommand,
+    AAGUID, Authenticator, CommandCode, MaxMsgSize, Settings, StatusCode, TooSmall, UnknownCommand,
 };
 use crate::cbor::{self, validate};
 

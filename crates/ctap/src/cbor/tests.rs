@@ -162,9 +162,21 @@ fn indefinite_lengths_and_tags_are_refused() {
 #[test]
 fn tags_read_as_fields_are_malformed() {
     for tagged in [&[0xC1, 0x01][..], &[0xD7, 0x01], &[0xD8, 0x20, 0x01]] {
-        assert_eq!(Decoder::new(tagged).unsigned(), Err(Error::Malformed), "{tagged:02x?}");
-        assert_eq!(Decoder::new(tagged).text(), Err(Error::Malformed), "{tagged:02x?}");
-        assert_eq!(Decoder::new(tagged).bool(), Err(Error::Malformed), "{tagged:02x?}");
+        assert_eq!(
+            Decoder::new(tagged).unsigned(),
+            Err(Error::Malformed),
+            "{tagged:02x?}"
+        );
+        assert_eq!(
+            Decoder::new(tagged).text(),
+            Err(Error::Malformed),
+            "{tagged:02x?}"
+        );
+        assert_eq!(
+            Decoder::new(tagged).bool(),
+            Err(Error::Malformed),
+            "{tagged:02x?}"
+        );
     }
 }
 
