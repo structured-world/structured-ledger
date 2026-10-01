@@ -1,0 +1,120 @@
+name: Release assets
+
+# Builds every device of ledger_app.toml with Ledger's reusable build for a release and attaches
+# the installable files to it. release-plz creates the release as a draft and calls this workflow
+# (GitHub starts no workflow on events of a draft release); the draft is published only after its
+# files are attached, so a published release never lacks them and immutable releases (whose
+# assets cannot change after publication) keep working. Can be run by hand for an existing tag; a
+# tag without a release gets a pre-release the same way.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to build (vX.Y.Z or vX.Y.Z-suffix)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build (vX.Y.Z or vX.Y.Z-suffix)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Check the tag against the application version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.tag.outputs.commit }}
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      # Qualified, so a branch with the same name is never taken for the tag; the build then gets
+      # the tag's commit, not a name it would resolve again.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      # The device shows the workspace version: a release named otherwise would mislabel the
+      # binaries. A suffix after the version marks a test or pre-release build of that version;
+      # it takes only SemVer pre-release characters, since the tag becomes part of file names.
+      - name: Compare
+        id: tag
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "structured-passkeys-app") | .version')
+          suffix=${TAG#"v${version}"}
+          if [[ "${TAG}" != "v${version}"* ]] || ! [[ "${suffix}" =~ ^(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag ${TAG} is not v${version} or v${version}-<pre-release>"
+            exit 1
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "commit=$(git rev-parse HEAD)"
+          } >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build for every device
+    needs: version
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: write
+    uses: LedgerHQ/ledger-app-workflows/.github/workflows/reusable_build.yml@db5fd3d8e4fe724ccc4617709c9e245976ee8280 # v1
+    with:
+      app_branch_name: ${{ needs.version.outputs.commit }}
+      upload_app_binaries_artifact: structured_passkeys_release
+      builder: ledger-app-builder
+
+  attach:
+    name: Attach the files to the release
+    needs:
+      - version
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: structured_passkeys_release
+          path: binaries
+      # The build leaves <device>/release/structured-passkeys-app with its .apdu, .hex and
+      # .sha256 (the application hash the device shows at installation). Every file gets the
+      # tag and the device in its name; SHA256SUMS covers the downloads.
+      - name: Name the files per device
+        run: |
+          set -euo pipefail
+          mkdir assets
+          for dir in binaries/*/release; do
+            device=$(basename "$(dirname "${dir}")")
+            base="assets/structured-passkeys-${TAG}-${device}"
+            cp "${dir}/structured-passkeys-app" "${base}.elf"
+            cp "${dir}/structured-passkeys-app.apdu" "${base}.apdu"
+            cp "${dir}/structured-passkeys-app.hex" "${base}.hex"
+            cp "${dir}/structured-passkeys-app.sha256" "${base}.sha256"
+          done
+          cd assets
+          sha256sum -- * > SHA256SUMS
+          ls -l
+      - name: Upload and publish
+        run: |
+          set -euo pipefail
+          if ! gh release view "${TAG}" > /dev/null 2>&1; then
+            gh release create "${TAG}" --verify-tag --draft --prerelease --title "${TAG}" \
+              --notes "Build of ${TAG} for every device."
+          fi
+          gh release upload "${TAG}" assets/* --clobber
+          if [[ "$(gh release view "${TAG}" --json isDraft --jq .isDraft)" == "true" ]]; then
+            gh release edit "${TAG}" --draft=false
+          fi

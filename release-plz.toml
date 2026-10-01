@@ -1,0 +1,21 @@
+[workspace]
+# No crate is published to crates.io: versions come from the git tags. One version for the
+# whole workspace, carried by the device application, which shows it and writes it into its
+# install parameters.
+git_only = true
+semver_check = false
+release = false
+# Release only when the release pull request is merged, never on an ordinary commit.
+release_always = false
+
+[[package]]
+name = "structured-passkeys-app"
+release = true
+changelog_path = "CHANGELOG.md"
+# The application ships the core crate and is managed by the host tool, so their changes are
+# part of its release notes.
+changelog_include = ["structured-passkeys-ctap", "structured-passkeys"]
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+# The release-assets workflow attaches the device files to the draft and publishes it.
+git_release_draft = true

@@ -20,8 +20,24 @@ run() {
     "$@"
 }
 
+# Linters whose verdicts change between releases run at the versions CI installs
+# (.github/workflows/check.yml), so a local pass means a CI pass. `pinned LINE CMD...`
+# fails unless CMD prints LINE as one of its lines.
+pinned() {
+    local want=$1
+    shift
+    if ! "$@" 2>&1 | grep -qxF -- "${want}"; then
+        echo "$1: need the version CI uses ('${want}' from '$*')" >&2
+        exit 1
+    fi
+}
+pinned "version: 0.11.0" shellcheck --version
+pinned "1.7.12" actionlint -version
+
 run scripts/check-links.sh
 run shellcheck scripts/*.sh scripts/linux/*.sh
+# Workflow syntax and expressions, and shellcheck on their `run:` blocks.
+run actionlint
 run cargo fmt --all --check
 run cargo clippy "${host[@]}" --all-targets -- -D warnings
 run cargo nextest run "${host[@]}"

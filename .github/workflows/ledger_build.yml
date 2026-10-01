@@ -22,3 +22,8 @@ jobs:
     with:
       upload_app_binaries_artifact: structured_passkeys_binaries
       builder: ledger-app-builder
+      # Pull requests also build the target branch and get a comment with the ELF section and
+      # stack sizes per device against it. Not for pull requests from forks or from Dependabot:
+      # GitHub gives them a read-only token, and the reusable workflow puts the table only into
+      # that comment, so the target branch builds would produce nothing anyone sees.
+      build_comparison: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]') }}
