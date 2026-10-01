@@ -1,0 +1,21 @@
+name: Ledger guidelines
+
+# Ledger's guidelines enforcer, required for the Ledger catalog: manifest, icons,
+# load parameters, README and SDK version.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+
+jobs:
+  guidelines_enforcer:
+    name: Ledger guidelines enforcer
+    uses: LedgerHQ/ledger-app-workflows/.github/workflows/reusable_guidelines_enforcer.yml@v1

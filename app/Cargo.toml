@@ -1,0 +1,28 @@
+[package]
+name = "structured-ledger-app"
+description = "FIDO2 / passkey authenticator application for Ledger devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ledger_device_sdk = { version = "1.37.1", features = ["io_new", "nano_nbgl"] }
+
+# Read by the SDK build script into the install parameters of the binary. Icon paths are
+# relative to this directory.
+[package.metadata.ledger]
+name = "Structured Ledger"
+curve = ["secp256r1"]
+flags = "0"
+path = ["5722689'/5262163'"]
+nanosplus = { icon = "icons/key_14x14.png" }
+nanox = { icon = "icons/key_14x14.png" }
+stax = { icon = "icons/key_32x32.png" }
+flex = { icon = "icons/key_40x40.png" }
+apex_p = { icon = "icons/key_32x32.png" }
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+# Host crates. The device crate builds with the nightly that the Ledger
+# dev-tools image pins through RUSTUP_TOOLCHAIN, which overrides this file.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+targets = ["thumbv7em-none-eabihf"]
+profile = "minimal"

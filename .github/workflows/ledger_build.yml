@@ -1,0 +1,24 @@
+name: Ledger build
+
+# Ledger's reusable build, the build Ledger deploys from, for every device in
+# ledger_app.toml.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+
+jobs:
+  build:
+    name: Build for every device
+    uses: LedgerHQ/ledger-app-workflows/.github/workflows/reusable_build.yml@v1
+    with:
+      upload_app_binaries_artifact: structured_ledger_binaries
+      builder: ledger-app-builder
