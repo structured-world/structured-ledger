@@ -50,12 +50,10 @@ cleanup() {
     # The ref is absent when the run stopped before creating it.
     git -C "$root" update-ref -d "$ref" 2>/dev/null || true
     rm -rf "$work"
-    if [[ $remote_pending -eq 1 ]]; then
-        # shellcheck disable=SC2029 # the path is meant to be expanded here
-        if ! ssh "${ssh_options[@]}" "$destination" "rm -rf $remote_dir"; then
-            echo "remote directory $remote_dir could not be removed" >&2
-            rc=1
-        fi
+    # shellcheck disable=SC2029 # the path is meant to be expanded here
+    if [[ $remote_pending -eq 1 ]] && ! ssh "${ssh_options[@]}" "$destination" "rm -rf $remote_dir"; then
+        echo "remote directory $remote_dir could not be removed" >&2
+        rc=1
     fi
     exit "$rc"
 }
