@@ -17,3 +17,5 @@ changelog_path = "CHANGELOG.md"
 changelog_include = ["structured-passkeys-ctap", "structured-passkeys"]
 git_tag_name = "v{{ version }}"
 git_release_name = "v{{ version }}"
+# The release-assets workflow attaches the device files to the draft and publishes it.
+git_release_draft = true
