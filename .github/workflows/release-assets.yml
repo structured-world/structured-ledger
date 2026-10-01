@@ -23,12 +23,15 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.tag.outputs.commit }}
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
+      # Qualified, so a branch with the same name is never taken for the tag; the build then gets
+      # the tag's commit, not a name it would resolve again.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.TAG }}
+          ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
       - name: Rust toolchain from rust-toolchain.toml
         run: rustup toolchain install
@@ -46,7 +49,10 @@ jobs:
               exit 1
               ;;
           esac
-          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "tag=${TAG}"
+            echo "commit=$(git rev-parse HEAD)"
+          } >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build for every device
@@ -57,7 +63,7 @@ jobs:
       pull-requests: write
     uses: LedgerHQ/ledger-app-workflows/.github/workflows/reusable_build.yml@db5fd3d8e4fe724ccc4617709c9e245976ee8280 # v1
     with:
-      app_branch_name: ${{ needs.version.outputs.tag }}
+      app_branch_name: ${{ needs.version.outputs.commit }}
       upload_app_binaries_artifact: structured_passkeys_release
       builder: ledger-app-builder
 

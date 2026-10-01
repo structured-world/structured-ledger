@@ -50,10 +50,10 @@ jobs:
     name: Tag and GitHub release
     runs-on: ubuntu-latest
     if: github.repository_owner == 'structured-world'
-    # Two pushes landing together must not both try to tag the same version.
-    concurrency:
-      group: release-plz-release-${{ github.ref }}
-      cancel-in-progress: false
+    # No concurrency group: GitHub replaces a pending job of a group with the next one, which
+    # would drop the run of a merged release pull request when another push follows it. Parallel
+    # runs are safe, since with release_always = false only the run of the release pull request's
+    # merge commit releases.
     steps:
       - name: Release bot token
         id: app-token
