@@ -2,10 +2,14 @@
 //! is written out byte by byte from the specification tables, never produced by the code under
 //! test.
 
+use core::num::NonZeroU64;
+
 use super::{
-    BROADCAST_CID, Command, DeviceInfo, ErrorCode, Event, Frames, KeepaliveStatus,
-    MAX_MESSAGE_SIZE, PACKET_TIMEOUT_MS, Report, TooLong, Transport, UnknownCommand, keepalive,
+    BROADCAST_CID, Command, DEFAULT_PACKET_TIMEOUT_MS, DeviceInfo, ErrorCode, Event, Frames,
+    KeepaliveStatus, MAX_MESSAGE_SIZE, Report, TooLong, Transport, UnknownCommand, keepalive,
 };
+
+const PACKET_TIMEOUT_MS: u64 = DEFAULT_PACKET_TIMEOUT_MS.get();
 
 /// CBOR and MSG enabled: INIT reports capabilities 0x04 (CBOR, MSG implemented).
 const INFO: DeviceInfo = DeviceInfo {
@@ -394,13 +398,17 @@ fn a_late_packet_times_the_message_out() {
         transport.receive(&init_packet(1, 0x01, 200, &[0; 57]), 1000),
         Event::None
     );
+    let just_in_time = 1000 + PACKET_TIMEOUT_MS - 1;
     assert_eq!(
-        transport.receive(&cont_packet(1, 0, &[0; 59]), 1000 + PACKET_TIMEOUT_MS - 1),
+        transport.receive(&cont_packet(1, 0, &[0; 59]), just_in_time),
         Event::None
     );
-    // Exactly PACKET_TIMEOUT_MS after the previous packet is already late.
+    // Exactly the timeout after the previous packet is already late.
     assert_eq!(
-        reply(transport.receive(&cont_packet(1, 1, &[0; 59]), 1099 + PACKET_TIMEOUT_MS)),
+        reply(transport.receive(
+            &cont_packet(1, 1, &[0; 59]),
+            just_in_time + PACKET_TIMEOUT_MS
+        )),
         error(1, 0x05)
     );
 
@@ -412,6 +420,53 @@ fn a_late_packet_times_the_message_out() {
         reply(transport.receive(&cont_packet(1, 0, &[0; 59]), 4999)),
         error(1, 0x05)
     );
+}
+
+/// The default timeout is 500 ms, so a continuation delayed by host scheduling for a few hundred
+/// milliseconds still completes its message (§11.2.5.2).
+#[test]
+fn the_default_packet_timeout_is_500_ms() {
+    let mut transport = with_channels::<1024>(1);
+    assert_eq!(
+        transport.receive(&init_packet(1, 0x01, 200, &[0; 57]), 0),
+        Event::None
+    );
+    assert_eq!(
+        transport.receive(&cont_packet(1, 0, &[0; 59]), 499),
+        Event::None
+    );
+    assert_eq!(
+        reply(transport.receive(&cont_packet(1, 1, &[0; 59]), 999)),
+        error(1, 0x05)
+    );
+}
+
+/// A timeout set by the device replaces the default, for late packets and for polling alike.
+#[test]
+fn a_configured_packet_timeout_is_used() {
+    let timeout = NonZeroU64::new(40).expect("non-zero");
+    let mut transport = Transport::<1024>::new(INFO).with_packet_timeout(timeout);
+    assert_eq!(transport.packet_timeout_ms(), 40);
+    reply(transport.receive(&init_packet(BROADCAST_CID, 0x06, 8, &NONCE), 0));
+    assert_eq!(
+        transport.receive(&init_packet(1, 0x01, 200, &[0; 57]), 0),
+        Event::None
+    );
+    assert_eq!(
+        transport.receive(&cont_packet(1, 0, &[0; 59]), 39),
+        Event::None
+    );
+    assert_eq!(
+        reply(transport.receive(&cont_packet(1, 1, &[0; 59]), 79)),
+        error(1, 0x05)
+    );
+
+    assert_eq!(
+        transport.receive(&init_packet(1, 0x01, 200, &[0; 57]), 100),
+        Event::None
+    );
+    assert_eq!(transport.poll(139), Event::None);
+    assert_eq!(reply(transport.poll(140)), error(1, 0x05));
 }
 
 /// After a timeout the device is idle again: another channel's request is served, not refused

@@ -6,7 +6,9 @@
 //! into a timer poll without a report. Every event is checked against the invariants the device
 //! relies on.
 
-use structured_passkeys_ctap::ctaphid::{Command, Event, Frames, REPORT_SIZE, Report, Transport};
+use structured_passkeys_ctap::ctaphid::{
+    BROADCAST_CID, Command, Event, Frames, REPORT_SIZE, Report, Transport,
+};
 
 /// Buffer size of the harness: small enough that BCNT above it is common.
 const BUFFER: usize = 1024;
@@ -21,6 +23,8 @@ pub fn run(data: &[u8]) {
         cbor: true,
         msg: true,
     });
+    // Channels handed out by INIT replies on the broadcast channel (§11.2.3).
+    let mut allocated: Vec<u32> = Vec::new();
     let mut now: u64 = 0;
     let (steps, _) = data.as_chunks::<STEP>();
     for step in steps {
@@ -61,6 +65,21 @@ pub fn run(data: &[u8]) {
                 if command == Command::Error {
                     assert_eq!(payload.len(), 1);
                 }
+                if command == Command::Init {
+                    assert_eq!(payload.len(), 17);
+                    let channel =
+                        u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+                    if cid == BROADCAST_CID {
+                        // A fresh channel each time, never a reserved one.
+                        assert!(channel != 0 && channel != BROADCAST_CID);
+                        assert!(!allocated.contains(&channel), "channel {channel} reused");
+                        allocated.push(channel);
+                    } else {
+                        // INIT on a channel confirms that channel, which must be allocated.
+                        assert_eq!(channel, cid);
+                        assert!(allocated.contains(&cid), "INIT on unallocated {cid}");
+                    }
+                }
                 let frames: Vec<Report> = Frames::new(cid, command, payload)
                     .expect("replies fit the framing")
                     .collect();
@@ -80,6 +99,8 @@ pub fn run(data: &[u8]) {
                 payload,
             } => {
                 assert!(matches!(command, Command::Msg | Command::Cbor));
+                // §11.2.3: requests only on allocated channels, never 0 or the broadcast one.
+                assert!(allocated.contains(&cid), "request on unallocated {cid}");
                 assert!(payload.len() <= BUFFER);
                 assert_eq!(transport.active(), Some(cid));
                 if finish_after {
@@ -87,6 +108,7 @@ pub fn run(data: &[u8]) {
                 }
             }
             Event::Cancel { cid } => {
+                assert!(allocated.contains(&cid), "cancel on unallocated {cid}");
                 assert_eq!(active_before, Some(cid));
                 assert_eq!(transport.active(), Some(cid));
             }

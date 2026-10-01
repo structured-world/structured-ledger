@@ -27,6 +27,8 @@
 //! assert_eq!(reports.len(), 1);
 //! ```
 
+use core::num::NonZeroU64;
+
 use zeroize::Zeroize;
 
 /// Size of a CTAPHID report in bytes (§11.2.8.1, full-speed endpoints).
@@ -41,9 +43,11 @@ pub const BROADCAST_CID: u32 = 0xFFFF_FFFF;
 /// Largest payload the framing can carry: `64 - 7 + 128 * (64 - 5)` (§11.2.4).
 pub const MAX_MESSAGE_SIZE: usize = INIT_DATA + 128 * CONT_DATA;
 
-/// Time allowed between two packets of one request before it is abandoned (§11.2.5.2 requires a
-/// timeout without fixing it; hosts send the packets of a message back to back).
-pub const PACKET_TIMEOUT_MS: u64 = 100;
+/// Default time allowed between two packets of one request before it is abandoned; see
+/// [`Transport::with_packet_timeout`]. §11.2.5.2 requires a timeout without fixing it. Hosts
+/// send the packets of a message back to back, so the margin is only for host scheduling and
+/// USB latency; 500 ms leaves plenty, and a stalled channel still frees the device quickly.
+pub const DEFAULT_PACKET_TIMEOUT_MS: NonZeroU64 = NonZeroU64::new(500).expect("non-zero");
 
 /// CTAPHID protocol version reported by INIT (§11.2.9.1.3).
 const PROTOCOL_VERSION: u8 = 2;
@@ -147,8 +151,13 @@ pub enum KeepaliveStatus {
 }
 
 /// What INIT reports about the device (§11.2.9.1.3). The capability flags are derived from it, so
-/// they always match the commands the transport accepts; WINK is never claimed, since it is not
-/// implemented.
+/// they always match the commands the transport accepts; WINK is never claimed.
+///
+/// The optional LOCK and WINK (§11.2.9.2) are left out on purpose. LOCK reserves the device for
+/// one channel for up to 10 seconds so a host can chain several messages; every request here is a
+/// single message and the busy state already serializes them, so a lock would only let one client
+/// shut the others out. WINK asks the device to show which one it is; this device puts every
+/// request on its own screen and asks for confirmation there, so a wink would add nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
     /// Major, minor and build device version numbers (vendor defined).
@@ -251,6 +260,7 @@ pub struct Transport<const N: usize> {
     state: State,
     last_cid: u32,
     info: DeviceInfo,
+    packet_timeout_ms: u64,
 }
 
 impl<const N: usize> Drop for Transport<N> {
@@ -262,7 +272,8 @@ impl<const N: usize> Drop for Transport<N> {
 impl<const N: usize> Transport<N> {
     const SIZE_IN_RANGE: () = assert!(N >= INIT_DATA && N <= MAX_MESSAGE_SIZE);
 
-    /// Creates an idle transport with no channel allocated.
+    /// Creates an idle transport with no channel allocated and the
+    /// [`DEFAULT_PACKET_TIMEOUT_MS`] packet timeout.
     pub const fn new(info: DeviceInfo) -> Self {
         let () = Self::SIZE_IN_RANGE;
         Self {
@@ -272,7 +283,33 @@ impl<const N: usize> Transport<N> {
             state: State::Idle,
             last_cid: 0,
             info,
+            packet_timeout_ms: DEFAULT_PACKET_TIMEOUT_MS.get(),
         }
+    }
+
+    /// Sets the time allowed between two packets of one request; a message whose next packet
+    /// comes this late or later is abandoned with `ERR_MSG_TIMEOUT` (§11.2.5.2).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::num::NonZeroU64;
+    /// use structured_passkeys_ctap::ctaphid::{DeviceInfo, Transport};
+    ///
+    /// let info = DeviceInfo { version: [0, 1, 0], cbor: true, msg: false };
+    /// let timeout = NonZeroU64::new(750).expect("non-zero");
+    /// let transport = Transport::<1024>::new(info).with_packet_timeout(timeout);
+    /// assert_eq!(transport.packet_timeout_ms(), 750);
+    /// ```
+    #[must_use]
+    pub const fn with_packet_timeout(mut self, timeout_ms: NonZeroU64) -> Self {
+        self.packet_timeout_ms = timeout_ms.get();
+        self
+    }
+
+    /// Time allowed between two packets of one request, in milliseconds.
+    pub const fn packet_timeout_ms(&self) -> u64 {
+        self.packet_timeout_ms
     }
 
     /// Zeroes the request bytes held in the buffer: a request can carry PIN/UV material.
@@ -311,7 +348,7 @@ impl<const N: usize> Transport<N> {
         // A clock that went backwards abandons the message too: its age is unknown.
         let expired = now_ms
             .checked_sub(last_packet_ms)
-            .is_none_or(|age| age >= PACKET_TIMEOUT_MS);
+            .is_none_or(|age| age >= self.packet_timeout_ms);
         if !expired {
             return None;
         }
@@ -506,8 +543,9 @@ impl<const N: usize> Transport<N> {
         report: &Report,
         now_ms: u64,
     ) -> Event<'_> {
-        // Only what INIT advertises is accepted: optional commands not implemented, device-to-host
-        // commands, CANCEL (handled before any request starts) and a disabled MSG or CBOR are not.
+        // Only what INIT advertises is accepted: the optional LOCK and WINK (left out, see
+        // `DeviceInfo`), device-to-host commands, CANCEL (handled before any request starts) and a
+        // disabled MSG or CBOR are not.
         if !self.info.accepts(command) {
             return self.error(cid, ErrorCode::InvalidCmd);
         }
@@ -655,7 +693,12 @@ impl Iterator for Frames<'_> {
                 }
                 debug_assert!(seq <= MAX_SEQ, "payload bounded by MAX_MESSAGE_SIZE");
                 report[4] = seq;
-                let take = (self.payload.len() - self.offset).min(CONT_DATA);
+                let take = self
+                    .payload
+                    .len()
+                    .checked_sub(self.offset)
+                    .expect("offset never passes the payload length")
+                    .min(CONT_DATA);
                 let end = self
                     .offset
                     .checked_add(take)
