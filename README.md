@@ -51,7 +51,8 @@ uvx --from ledgerwallet ledgerctl list
 ```
 
 The paths are those `scripts/linux/check.sh device` copies back; after `scripts/device-build.sh`
-they are under `app/target/` instead.
+they are under `app/target/` instead. Builds follow the newest Ledger SDK, so the device needs the
+current Ledger OS: status `0x511F` on loading means its OS is older, update it in Ledger Wallet.
 
 ## License
 
