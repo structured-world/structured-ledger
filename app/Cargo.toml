@@ -12,7 +12,7 @@ publish = false
 # `app_io_stack` runs the IO stack in the application, so the application can drive the FIDO HID
 # interface itself, and `AtomicStorage` reads the zeroed NVM Speculos loads instead of panicking;
 # both come from this fork of the Ledger Rust SDK until the published crate has them.
-ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "d67a8bee8a8778a3070d5869f61a094abf38a9cb", features = ["io_new", "nano_nbgl", "app_io_stack"] }
+ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "ca233e84833c0180a3dbf934b3f7720a65e8fd74", features = ["io_new", "nano_nbgl", "app_io_stack"] }
 structured-passkeys-ctap = { path = "../crates/ctap", default-features = false }
 
 # Read by the SDK build script into the install parameters of the binary. Icon paths are
