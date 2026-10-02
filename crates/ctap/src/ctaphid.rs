@@ -21,10 +21,13 @@
 //! report[6] = 8;
 //! report[7..15].copy_from_slice(b"nonce123");
 //! assert_eq!(transport.receive(&report, 0), Event::None);
-//! // The INIT response is one report on the broadcast channel, then nothing is left to send.
-//! let response = transport.next_report(0).expect("INIT is answered by the transport");
+//! // The INIT response is one report on the broadcast channel: the device hands it to its stack
+//! // (`taken`), the host reads it (`sent`), and nothing is left to send.
+//! let response = transport.next_report().expect("INIT is answered by the transport");
 //! assert_eq!((&response[..4], response[4], response[6]), (&[0xFF; 4][..], 0x86, 17));
-//! assert_eq!(transport.next_report(0), None);
+//! transport.taken(0);
+//! transport.sent();
+//! assert_eq!(transport.next_report(), None);
 //! ```
 
 use core::borrow::BorrowMut;
@@ -244,6 +247,17 @@ pub enum RespondError {
     TooLong,
 }
 
+/// What taking the offered report changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// The queued error at this index goes.
+    Error(usize),
+    /// The pending keepalive goes.
+    Keepalive,
+    /// The response moves to this report; `None` after its last one.
+    Frame(Option<Cursor>),
+}
+
 /// The next report of a message being sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cursor {
@@ -316,15 +330,21 @@ impl ErrorQueue {
         }
     }
 
-    /// Takes the oldest error not addressed to `held`, whose errors wait for its response to end.
-    fn pop_except(&mut self, held: Option<u32>) -> Option<(u32, ErrorCode)> {
+    /// The oldest error not addressed to `held`, whose errors wait for its response to end.
+    fn first_except(&self, held: Option<u32>) -> Option<(usize, (u32, ErrorCode))> {
         let queued = self.entries.get(..self.len)?;
         let index = queued.iter().position(|&(cid, _)| Some(cid) != held)?;
-        let entry = queued[index];
+        Some((index, queued[index]))
+    }
+
+    /// Removes the error at `index`, keeping the order of the others.
+    fn remove(&mut self, index: usize) {
+        if index >= self.len {
+            return;
+        }
         let next = index.checked_add(1).expect("index < len <= ERROR_QUEUE");
         self.entries.copy_within(next..self.len, index);
-        self.len = self.len.checked_sub(1).expect("the queue held `entry`");
-        Some(entry)
+        self.len = self.len.checked_sub(1).expect("index < len");
     }
 }
 
@@ -584,59 +604,76 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         }
     }
 
-    /// The next report to send, once the endpoint is free: queued errors first, then a due
+    /// The report to send next and what taking it changes: queued errors first, then a due
     /// keepalive, then the next report of the response being sent. An error for the channel
     /// whose response is being sent waits until that response is out, so the channel's own
-    /// message is never split by another initialization packet (§11.2.4). `None` when nothing
-    /// waits.
-    pub fn next_report(&mut self, now_ms: u64) -> Option<Report> {
+    /// message is never split by another initialization packet (§11.2.4).
+    fn plan(&self) -> Option<(Report, Step)> {
         let sending = match self.state {
             State::Sending { cid, .. } => Some(cid),
             _ => None,
         };
-        if let Some((cid, code)) = self.errors.pop_except(sending) {
-            return Some(error_report(cid, code));
+        if let Some((index, (cid, code))) = self.errors.first_except(sending) {
+            return Some((error_report(cid, code), Step::Error(index)));
         }
         if let State::Processing { cid, status, .. } = self.state
             && self.keepalive_pending
         {
-            self.keepalive_pending = false;
-            return Some(keepalive_report(cid, status));
+            return Some((keepalive_report(cid, status), Step::Keepalive));
         }
         let State::Sending {
             cid,
             command,
             len,
-            next,
+            next: Some(next),
             ..
         } = self.state
         else {
+            // Nothing to send, or the last report waits for `sent`.
             return None;
         };
-        let Some(next) = next else {
-            // The last report waits for `sent`.
-            return None;
-        };
-        if len > N {
-            // `len <= N` whenever a message is sent; a violation drops it.
-            self.reset();
-            return None;
-        }
-        let (report, following) = frame(cid, command, &self.bytes()[..len], next);
-        // After the last report the device stays busy until the host has read it (`sent`).
-        self.state = State::Sending {
-            cid,
-            command,
-            len,
-            next: following,
-            last_progress_ms: now_ms,
-        };
-        Some(report)
+        // `len <= N` whenever a message is sent ([`Transport::respond`], `complete`).
+        let payload = self.bytes().get(..len)?;
+        let (report, following) = frame(cid, command, payload, next);
+        Some((report, Step::Frame(following)))
     }
 
-    /// The host read the report last handed out by [`Transport::next_report`]; called by the
-    /// device on every IN completion. After the last report of a response, the transaction ends
-    /// and its data goes (§11.2.5.1: busy until the response is sent).
+    /// The next report to send once the endpoint is free, without consuming it: the device
+    /// passes it to its stack and calls [`Transport::taken`] when the stack accepted it, so a
+    /// report the stack refuses is offered again. After an abort the answer that replaced the
+    /// aborted one comes instead. `None` when nothing waits.
+    pub fn next_report(&self) -> Option<Report> {
+        self.plan().map(|(report, _)| report)
+    }
+
+    /// The device's stack accepted the report [`Transport::next_report`] offered at `now_ms`;
+    /// the following one is due next.
+    pub fn taken(&mut self, now_ms: u64) {
+        let Some((_, step)) = self.plan() else {
+            return;
+        };
+        match step {
+            Step::Error(index) => self.errors.remove(index),
+            Step::Keepalive => self.keepalive_pending = false,
+            Step::Frame(following) => {
+                if let State::Sending {
+                    next,
+                    last_progress_ms,
+                    ..
+                } = &mut self.state
+                {
+                    // After the last report the device stays busy until the host has read it
+                    // (`sent`).
+                    *next = following;
+                    *last_progress_ms = now_ms;
+                }
+            }
+        }
+    }
+
+    /// The host read the report last taken; called by the device on every IN completion. After
+    /// the last report of a response, the transaction ends and its data goes (§11.2.5.1: busy
+    /// until the response is sent).
     pub fn sent(&mut self) {
         if let State::Sending { next: None, .. } = self.state {
             self.reset();

@@ -247,12 +247,9 @@ struct Hid {
     pdev: *mut c_void,
     /// A report is in the IN endpoint and the host has not read it yet.
     in_flight: bool,
-    /// A report taken from the transport that the stack did not accept; sent before anything
-    /// else, so a response is never left with a hole.
-    pending: Option<Report>,
-    /// The OUT endpoint is left unarmed because the transport cannot take a report yet
-    /// ([`Transport::can_receive`]); armed again once it can.
-    out_paused: bool,
+    /// The OUT endpoint is not armed: the transport could not take a report yet
+    /// ([`Transport::can_receive`]) or the stack refused to arm it. `pump` arms it again.
+    out_unarmed: bool,
     /// Transport clock: [`TICK_MS`] per ticker event.
     now_ms: u64,
 }
@@ -296,8 +293,7 @@ pub fn start() {
         response,
         pdev: core::ptr::null_mut(),
         in_flight: false,
-        pending: None,
-        out_paused: false,
+        out_unarmed: false,
         now_ms: 0,
     };
     // SAFETY: not started yet, so nothing refers to the slot.
@@ -336,45 +332,50 @@ impl Hid {
         self.pump();
     }
 
-    /// Puts the next report into the IN endpoint if it is free, then arms the OUT endpoint again
-    /// if it was held back and the transport can take a report now.
+    /// Puts the next report into the IN endpoint if it is free, then arms the OUT endpoint if it
+    /// was left unarmed.
     fn pump(&mut self) {
-        if !self.in_flight && !self.pdev.is_null() {
-            let report = match self.pending.take() {
-                Some(report) => Some(report),
-                None => self.transport.next_report(self.now_ms),
+        if !self.in_flight
+            && !self.pdev.is_null()
+            && let Some(report) = self.transport.next_report()
+        {
+            // SAFETY: `pdev` is the handle the stack passed to the class; the stack copies the
+            // report out before returning.
+            let status = unsafe {
+                USBD_LL_Transmit(self.pdev, EP_IN, report.as_ptr(), REPORT_SIZE as u32, 0)
             };
-            if let Some(report) = report {
-                // SAFETY: `pdev` is the handle the stack passed to the class; the stack copies
-                // the report out before returning.
-                let status = unsafe {
-                    USBD_LL_Transmit(self.pdev, EP_IN, report.as_ptr(), REPORT_SIZE as u32, 0)
-                };
-                if status == USBD_OK {
-                    self.in_flight = true;
-                } else {
-                    // Retried on the next completion or tick.
-                    self.pending = Some(report);
-                }
+            // A refused report stays with the transport, which offers it again on the next
+            // completion or tick, or whatever replaced it if its transaction was aborted.
+            if status == USBD_OK {
+                self.transport.taken(self.now_ms);
+                self.in_flight = true;
             }
         }
-        if self.out_paused && !self.pdev.is_null() && self.transport.can_receive() {
-            // SAFETY: `pdev` is the stack's handle; a null buffer lets the stack deliver the
-            // report in its own transfer buffer.
-            let status = unsafe {
-                USBD_LL_PrepareReceive(self.pdev, EP_OUT, core::ptr::null_mut(), REPORT_SIZE as u32)
-            };
-            // Retried on the next completion or tick when the stack refuses.
-            self.out_paused = status != USBD_OK;
+        if self.out_unarmed {
+            self.arm_out();
         }
+    }
+
+    /// Arms the OUT endpoint for the next report once the transport can take one; while it
+    /// cannot, or when the stack refuses, the endpoint stays marked for `pump` to retry.
+    fn arm_out(&mut self) {
+        self.out_unarmed = true;
+        if self.pdev.is_null() || !self.transport.can_receive() {
+            return;
+        }
+        // SAFETY: `pdev` is the stack's handle; a null buffer lets the stack deliver the report
+        // in its own transfer buffer.
+        let status = unsafe {
+            USBD_LL_PrepareReceive(self.pdev, EP_OUT, core::ptr::null_mut(), REPORT_SIZE as u32)
+        };
+        self.out_unarmed = status != USBD_OK;
     }
 
     /// Forgets the transaction and every queued report, wiping the buffer.
     fn reset(&mut self) {
         self.transport.restart();
         self.in_flight = false;
-        self.pending = None;
-        self.out_paused = false;
+        self.out_unarmed = false;
     }
 }
 
@@ -490,23 +491,20 @@ unsafe extern "C" fn data_out(
         let received = unsafe { core::slice::from_raw_parts(packet, REPORT_SIZE) };
         received.try_into().ok()
     };
-    let arm = with_hid(|hid| {
+    let handled = with_hid(|hid| {
         hid.pdev = pdev;
         if let Some(report) = &report {
             let event = hid.transport.receive(report, hid.now_ms);
             hid.handle(event);
         }
-        // A full error queue holds the host back: the endpoint stays unarmed until the queued
-        // errors have been sent (`pump`).
-        let arm = hid.transport.can_receive();
-        hid.out_paused = !arm;
-        arm
-    })
-    .unwrap_or(true);
-    if !arm {
+        // A full error queue holds the host back, and a refused arming is retried: either way
+        // the endpoint stays marked until `pump` arms it.
+        hid.arm_out();
+    });
+    if handled.is_some() {
         return USBD_OK;
     }
-    // SAFETY: `pdev` is the stack's handle; the endpoint is armed for the next report.
+    // SAFETY: before `start` nothing holds the endpoint back; `pdev` is the stack's handle.
     unsafe { USBD_LL_PrepareReceive(pdev, EP_OUT, core::ptr::null_mut(), REPORT_SIZE as u32) }
 }
 

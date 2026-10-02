@@ -42,11 +42,18 @@ fn cont_packet(cid: u32, seq: u8, data: &[u8]) -> Report {
     report
 }
 
+/// Takes the next report as a device does: offered, then accepted by its stack at `now`.
+fn take<const N: usize>(transport: &mut Transport<N>, now: u64) -> Option<Report> {
+    let report = transport.next_report()?;
+    transport.taken(now);
+    Some(report)
+}
+
 /// Every report the transport has to send at `now`, in order, each read by the host as a device
 /// would report it (`sent` after every endpoint completion).
 fn drain<const N: usize>(transport: &mut Transport<N>, now: u64) -> Vec<Report> {
     let mut reports = Vec::new();
-    while let Some(report) = transport.next_report(now) {
+    while let Some(report) = take(transport, now) {
         transport.sent();
         reports.push(report);
         assert!(reports.len() <= 200, "the transport never stops sending");
@@ -399,9 +406,7 @@ fn the_device_is_busy_until_the_response_is_sent() {
         transport.receive(&cont_packet(1, 0, &[0x42; 59]), 0),
         Event::None
     );
-    let first = transport
-        .next_report(0)
-        .expect("the first report of the echo");
+    let first = take(&mut transport, 0).expect("the first report of the echo");
     assert_eq!(first[4], 0x81);
     assert_eq!(
         transport.receive(&init_packet(2, 0x01, 0, &[]), 0),
@@ -424,6 +429,27 @@ fn the_device_is_busy_until_the_response_is_sent() {
     );
 }
 
+/// Looking at the next report does not consume it: a device whose stack refuses the report asks
+/// again and gets the same one, so a response never loses a packet. Once its transaction is
+/// aborted, the next look gives the answer that replaced it, never a stale packet.
+#[test]
+fn a_report_is_consumed_only_once_taken() {
+    let mut transport = with_channels::<1024>(1);
+    transport.receive(&init_packet(1, 0x01, 116, &[7; 57]), 0);
+    transport.receive(&cont_packet(1, 0, &[7; 59]), 0);
+    let first = transport
+        .next_report()
+        .expect("the first report of the echo");
+    assert_eq!(
+        transport.next_report(),
+        Some(first),
+        "not taken, so offered again"
+    );
+    transport.receive(&init_packet(1, 0x06, 8, &NONCE), 0);
+    let replaced = transport.next_report().expect("the INIT response");
+    assert_eq!(replaced[4], 0x86, "the aborted echo is gone");
+}
+
 /// The busy period ends when the host has read the last report of a response, not when the
 /// device handed it to the endpoint (§11.2.5.1): until `sent` acknowledges that completion,
 /// another channel is still busy.
@@ -431,13 +457,13 @@ fn the_device_is_busy_until_the_response_is_sent() {
 fn the_device_is_busy_until_the_last_report_is_read() {
     let mut transport = with_channels::<1024>(2);
     transport.receive(&init_packet(1, 0x01, 1, &[0x42]), 0);
-    let echo = transport.next_report(0).expect("the one-report echo");
+    let echo = take(&mut transport, 0).expect("the one-report echo");
     assert_eq!(messages(&[echo]), vec![(1, 0x01, vec![0x42])]);
     assert_eq!(
         transport.receive(&init_packet(2, 0x01, 0, &[]), 0),
         Event::None
     );
-    let busy = transport.next_report(0).expect("the busy error");
+    let busy = take(&mut transport, 0).expect("the busy error");
     assert_eq!(messages(&[busy]), vec![error(2, 0x06)], "echo not read yet");
     transport.sent();
     assert_eq!(
@@ -455,9 +481,7 @@ fn a_busy_error_does_not_split_the_channels_own_response() {
     let mut transport = with_channels::<1024>(2);
     transport.receive(&init_packet(1, 0x01, 116, &[9; 57]), 0);
     transport.receive(&cont_packet(1, 0, &[9; 59]), 0);
-    let first = transport
-        .next_report(0)
-        .expect("the first report of the echo");
+    let first = take(&mut transport, 0).expect("the first report of the echo");
     transport.receive(&init_packet(1, 0x01, 0, &[]), 0);
     transport.receive(&init_packet(2, 0x01, 0, &[]), 0);
     let rest = drain(&mut transport, 0);
@@ -476,7 +500,7 @@ fn a_restart_forgets_channels_and_transactions() {
     transport.receive(&cont_packet(1, 0, &[7; 59]), 0);
     transport.receive(&init_packet(9, 0x01, 0, &[]), 0);
     transport.restart();
-    assert_eq!(transport.next_report(0), None, "nothing stale is sent");
+    assert_eq!(transport.next_report(), None, "nothing stale is sent");
     assert!(transport.buffer.iter().all(|&byte| byte == 0));
     assert_eq!(
         answer(&mut transport, &init_packet(2, 0x01, 0, &[]), 0),
@@ -499,9 +523,7 @@ fn init_aborts_a_response_being_sent() {
     let mut transport = with_channels::<1024>(1);
     transport.receive(&init_packet(1, 0x01, 116, &[7; 57]), 0);
     transport.receive(&cont_packet(1, 0, &[7; 59]), 0);
-    transport
-        .next_report(0)
-        .expect("the first report of the echo");
+    take(&mut transport, 0).expect("the first report of the echo");
     assert_eq!(
         transport.receive(&init_packet(1, 0x11, 0, &[]), 0),
         Event::None
@@ -515,7 +537,7 @@ fn init_aborts_a_response_being_sent() {
         (cid, command, &payload[8..12]),
         (1, 0x06, &[0, 0, 0, 1][..])
     );
-    assert_eq!(transport.next_report(0), None);
+    assert_eq!(transport.next_report(), None);
 }
 
 /// A response the host stops reading is dropped after the packet timeout, so the device does
@@ -525,21 +547,17 @@ fn a_response_the_host_stops_reading_is_dropped() {
     let mut transport = with_channels::<1024>(2);
     transport.receive(&init_packet(1, 0x01, 116, &[7; 57]), 0);
     transport.receive(&cont_packet(1, 0, &[7; 59]), 0);
-    transport
-        .next_report(100)
-        .expect("the first report of the echo");
+    take(&mut transport, 100).expect("the first report of the echo");
     let just_in_time = 100 + PACKET_TIMEOUT_MS - 1;
     transport.poll(just_in_time);
     assert_eq!(
         transport.receive(&init_packet(2, 0x01, 0, &[]), just_in_time),
         Event::None
     );
-    let busy = transport
-        .next_report(just_in_time)
-        .expect("the busy error comes first");
+    let busy = take(&mut transport, just_in_time).expect("the busy error comes first");
     assert_eq!(messages(&[busy]), vec![error(2, 0x06)], "still sending");
     transport.poll(100 + PACKET_TIMEOUT_MS);
-    assert_eq!(transport.next_report(1000), None);
+    assert_eq!(transport.next_report(), None);
     assert_eq!(
         answer(&mut transport, &init_packet(2, 0x01, 0, &[]), 1000),
         (2, 0x01, Vec::new())
@@ -558,7 +576,7 @@ fn respond_refuses_a_missing_request_and_an_oversized_answer() {
     assert_eq!(transport.active(), Some(1));
     answer(&mut transport, &init_packet(1, 0x06, 8, &NONCE), 0);
     assert_eq!(transport.respond(&[0], 0), Err(RespondError::NotActive));
-    assert_eq!(transport.next_report(0), None);
+    assert_eq!(transport.next_report(), None);
 }
 
 /// While a request is processed the device sends a keepalive at least every 100 ms
@@ -569,7 +587,7 @@ fn keepalives_follow_the_processing_request() {
     let mut transport = with_channels::<1024>(1);
     cbor_request(&mut transport, 1, 1000);
     transport.poll(1010);
-    assert_eq!(transport.next_report(1010), None, "too soon");
+    assert_eq!(transport.next_report(), None, "too soon");
     let mut processing = [0u8; 64];
     processing[..8].copy_from_slice(&[0, 0, 0, 1, 0xBB, 0x00, 0x01, 0x01]);
     for tick in 1..=3 {
@@ -582,14 +600,14 @@ fn keepalives_follow_the_processing_request() {
     up_needed[7] = 0x02;
     assert_eq!(drain(&mut transport, 1310), vec![up_needed]);
     transport.set_status(KeepaliveStatus::UpNeeded);
-    assert_eq!(transport.next_report(1310), None, "no change, no keepalive");
+    assert_eq!(transport.next_report(), None, "no change, no keepalive");
     transport.poll(1400);
     assert_eq!(drain(&mut transport, 1400), vec![up_needed]);
     transport.poll(1500);
     assert_eq!(transport.respond(&[0x00], 1500), Ok(()));
     assert_eq!(sent(&mut transport, 1500), vec![(1, 0x10, vec![0x00])]);
     transport.poll(1600);
-    assert_eq!(transport.next_report(1600), None);
+    assert_eq!(transport.next_report(), None);
 }
 
 /// Errors wait for the endpoint in order; a host that sends faster than it reads loses the
@@ -620,7 +638,7 @@ fn a_full_error_queue_holds_reports_back() {
     }
     transport.receive(&init_packet(13, 0x01, 0, &[]), 0);
     assert!(!transport.can_receive(), "the fourth error fills the queue");
-    transport.next_report(0).expect("the oldest error");
+    take(&mut transport, 0).expect("the oldest error");
     assert!(transport.can_receive());
 }
 
@@ -951,7 +969,7 @@ fn message_bytes_are_wiped_when_the_transaction_ends() {
     let mut unread = with_channels::<1024>(1);
     unread.receive(&init_packet(1, 0x01, 100, &secret), 0);
     unread.receive(&cont_packet(1, 0, &secret[..43]), 0);
-    unread.next_report(0);
+    take(&mut unread, 0);
     unread.poll(PACKET_TIMEOUT_MS);
     assert!(wiped(&unread), "response the host stopped reading");
 }

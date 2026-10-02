@@ -112,9 +112,16 @@ fn take(transport: &mut Transport<BUFFER>, host: &mut Host, now: u64, one: bool)
     let mut count = 0;
     loop {
         let active = transport.active();
-        let Some(report) = transport.next_report(now) else {
+        let Some(report) = transport.next_report() else {
             return count;
         };
+        // Looking does not consume: a report the stack refused is offered again unchanged.
+        assert_eq!(
+            transport.next_report(),
+            Some(report),
+            "offered twice, not taken"
+        );
+        transport.taken(now);
         // The host reads it, as the device reports on its IN completion.
         transport.sent();
         host.read(&report, active);
@@ -172,7 +179,7 @@ pub fn run(data: &[u8]) {
             }
             if is_cancel && drained {
                 // §11.2.9.1.5: CANCEL is never answered, whatever the state.
-                assert_eq!(transport.next_report(now), None, "CANCEL answered");
+                assert_eq!(transport.next_report(), None, "CANCEL answered");
             }
         }
         if flags & 1 == 1 && transport.active().is_some() {
