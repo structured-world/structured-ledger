@@ -464,6 +464,9 @@ impl<'a> Entries<'_, 'a> {
         };
         self.remaining = remaining;
         let encoded = self.decoder.encoded_item()?;
+        // Keys are compared by encoding, not decoded value: §8 makes the width of a float part
+        // of its value, so 1.0 as 16 and as 32 bits are distinct keys; a duplicate is a
+        // byte-identical key.
         if let Some(previous) = self.previous
             && canonical_order(previous, encoded) != Ordering::Less
         {

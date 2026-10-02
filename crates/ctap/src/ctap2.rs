@@ -107,6 +107,9 @@ pub enum StatusCode {
     MissingParameter = 0x14,
     /// Limit for number of items exceeded.
     LimitExceeded = 0x15,
+    // No 0x16: CTAP2_ERR_UNSUPPORTED_EXTENSION exists only in CTAP 2.0 and is absent from the
+    // §8.2 table; an extension the authenticator does not know is ignored (§8, unknown map
+    // keys), never rejected.
     /// Fingerprint database is full.
     FpDatabaseFull = 0x17,
     /// Large blob storage is full.
@@ -179,7 +182,9 @@ pub enum StatusCode {
 
 impl From<cbor::Error> for StatusCode {
     /// §8: a message not in the canonical form is CTAP2_ERR_INVALID_CBOR; a member of the wrong
-    /// type is CTAP2_ERR_CBOR_UNEXPECTED_TYPE.
+    /// type is CTAP2_ERR_CBOR_UNEXPECTED_TYPE. Nesting beyond four levels is one of the §8
+    /// encoding requirements, so it is INVALID_CBOR too; LIMIT_EXCEEDED (§8.2) is for item
+    /// counts.
     fn from(error: cbor::Error) -> Self {
         match error {
             cbor::Error::Malformed | cbor::Error::NotCanonical | cbor::Error::TooDeep => {
