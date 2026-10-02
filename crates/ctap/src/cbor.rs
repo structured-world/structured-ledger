@@ -229,11 +229,23 @@ impl<'a> Decoder<'a> {
     }
 
     fn expect(&mut self, wanted: Major) -> Result<u64, Error> {
+        let start = self.input;
         let (major, value) = self.head()?;
         if major == wanted {
             Ok(value)
         } else {
-            Err(Error::UnexpectedType)
+            Err(self.mismatch(start))
+        }
+    }
+
+    /// The error for an item of the wrong type starting at `start`: the item is read in full
+    /// first, so a malformed one stays an encoding error (§8: CBOR that does not conform is
+    /// INVALID_CBOR, only a well-formed member of the wrong type is CBOR_UNEXPECTED_TYPE).
+    fn mismatch(&mut self, start: &'a [u8]) -> Error {
+        self.input = start;
+        match self.skip() {
+            Ok(()) => Error::UnexpectedType,
+            Err(error) => error,
         }
     }
 
@@ -253,13 +265,14 @@ impl<'a> Decoder<'a> {
     /// [`Error::UnexpectedType`] for a non-integer or one outside `i64`, or the encoding errors
     /// of the item.
     pub fn int(&mut self) -> Result<i64, Error> {
+        let start = self.input;
         match self.head()? {
             (Major::Unsigned, value) => i64::try_from(value).map_err(|_| Error::UnexpectedType),
             // -1 - n, computed without overflow for every n that fits.
             (Major::Negative, value) => i64::try_from(value)
                 .map(|n| -1 - n)
                 .map_err(|_| Error::UnexpectedType),
-            _ => Err(Error::UnexpectedType),
+            _ => Err(self.mismatch(start)),
         }
     }
 
@@ -292,10 +305,11 @@ impl<'a> Decoder<'a> {
     ///
     /// [`Error::UnexpectedType`] for any other item, or the encoding errors of the item.
     pub fn bool(&mut self) -> Result<bool, Error> {
+        let start = self.input;
         match self.head()? {
             (Major::Simple, FALSE) => Ok(false),
             (Major::Simple, TRUE) => Ok(true),
-            _ => Err(Error::UnexpectedType),
+            _ => Err(self.mismatch(start)),
         }
     }
 

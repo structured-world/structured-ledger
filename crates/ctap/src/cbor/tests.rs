@@ -330,6 +330,48 @@ fn encoded_maps_and_arrays_are_canonical() {
     assert_eq!(validate(&bytes), Ok(()));
 }
 
+/// An item of the wrong type is an encoding error when it is malformed, and a type error only
+/// when it is well-formed (§8: CBOR that does not conform is INVALID_CBOR; a member of the
+/// wrong type is CBOR_UNEXPECTED_TYPE). Reading only its header would report the type first.
+#[test]
+fn a_malformed_item_of_another_type_is_malformed() {
+    // A byte string declaring three bytes and holding one.
+    let short = [0x43, 0x00];
+    assert_eq!(Decoder::new(&short).unsigned(), Err(Error::Malformed));
+    assert_eq!(Decoder::new(&short).int(), Err(Error::Malformed));
+    assert_eq!(Decoder::new(&short).bool(), Err(Error::Malformed));
+    assert_eq!(
+        Decoder::new(&short).array(|_| Ok(())),
+        Err(Error::Malformed)
+    );
+    // The same as the value of a map field that expects an integer: {1: h'00' short}.
+    let field = [0xA1, 0x01, 0x43, 0x00];
+    let read = Decoder::new(&field).map(|entries| {
+        entries.next_key()?;
+        entries.value().unsigned()
+    });
+    assert_eq!(read, Err(Error::Malformed));
+    // A malformed element inside a container of the wrong type: [h'00' short].
+    assert_eq!(
+        Decoder::new(&[0x81, 0x43, 0x00]).unsigned(),
+        Err(Error::Malformed)
+    );
+    // A non-canonical item of the wrong type: a one-byte length below 24.
+    assert_eq!(
+        Decoder::new(&[0x58, 0x01, 0x00]).unsigned(),
+        Err(Error::NotCanonical)
+    );
+    // A well-formed item of the wrong type stays a type error.
+    assert_eq!(
+        Decoder::new(&[0x41, 0x00]).unsigned(),
+        Err(Error::UnexpectedType)
+    );
+    assert_eq!(
+        Decoder::new(&[0x41, 0x00]).bool(),
+        Err(Error::UnexpectedType)
+    );
+}
+
 /// Writing past the buffer reports `Full` and keeps what was written.
 #[test]
 fn a_full_encoder_reports_it() {
