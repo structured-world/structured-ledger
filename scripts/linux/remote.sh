@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Remote half of scripts/linux/check.sh, run on the Linux check host.
 #
-#   remote.sh <run dir> <bundle ref> device
+#   remote.sh <run dir> <bundle ref> device|speculos
 #
 # Checks the snapshot out into <run dir>/src, runs the action there and packs
 # the device artifacts into <run dir>/artifacts.tar for the local side to
-# fetch. The local side removes <run dir> afterwards.
+# fetch. `speculos` builds as `device` does, then runs every build in Speculos
+# (scripts/speculos-check.sh). The local side removes <run dir> afterwards.
 set -uo pipefail
 
 dir="$1"
@@ -21,8 +22,11 @@ git checkout -q --detach FETCH_HEAD || exit 1
 
 status=0
 case "$action" in
-    device)
+    device | speculos)
         bash scripts/device-build.sh || status=1
+        if [[ "$action" == speculos && $status -eq 0 ]]; then
+            bash scripts/speculos-check.sh || status=1
+        fi
         # One directory per target: the ELF and what cargo-ledger derived from it.
         files=()
         for target in nanosplus nanox stax flex apex_p; do

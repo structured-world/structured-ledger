@@ -9,7 +9,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-ledger_device_sdk = { version = "1.38.0", features = ["io_new", "nano_nbgl"] }
+# `app_io_stack` runs the IO stack in the application, so the application can drive the FIDO HID
+# interface itself; it comes from this fork of the Ledger Rust SDK until the published crate has it.
+ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "e57a687a981e1395675f339de3feceb1d1580e7d", features = ["io_new", "nano_nbgl", "app_io_stack"] }
 
 # Read by the SDK build script into the install parameters of the binary. Icon paths are
 # relative to this directory.
