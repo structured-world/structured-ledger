@@ -1,32 +1,33 @@
 //! CTAPHID: the USB HID framing of CTAP (CTAP 2.2, §11.2 "USB Human Interface Device").
 //!
-//! [`Transport`] turns 64-byte HID reports into requests and transport-level replies, keeps the
-//! channel and busy state, and never allocates: the message buffer is a const-generic array.
-//! [`Frames`] splits a response into reports, [`keepalive`] builds a keepalive report.
+//! [`Transport`] owns both directions of the interface: it turns received 64-byte reports into
+//! requests for the CTAP layer, answers the transport commands itself, and hands out the reports
+//! to send, one at a time, as the endpoint frees up. The device layer only moves reports. The
+//! device stays busy from the first packet of a request until the last report of its response
+//! has been handed out (§11.2.5.1), and the transport never allocates: the message buffer is a
+//! const-generic array.
 //!
 //! # Examples
 //!
 //! ```
-//! use structured_passkeys_ctap::ctaphid::{
-//!     BROADCAST_CID, Command, DeviceInfo, Event, Frames, REPORT_SIZE, Transport,
-//! };
+//! use structured_passkeys_ctap::ctaphid::{BROADCAST_CID, DeviceInfo, Event, REPORT_SIZE, Transport};
 //!
 //! let info = DeviceInfo { version: [0, 1, 0], cbor: true, msg: false };
-//! let mut transport = Transport::<1024>::new(info);
+//! let mut transport = Transport::<1024>::new(info, [0; 1024]);
 //! // CTAPHID_INIT on the broadcast channel with an 8-byte nonce.
 //! let mut report = [0u8; REPORT_SIZE];
 //! report[..4].copy_from_slice(&BROADCAST_CID.to_be_bytes());
 //! report[4] = 0x86;
 //! report[6] = 8;
 //! report[7..15].copy_from_slice(b"nonce123");
-//! let Event::Reply { cid, command, payload } = transport.receive(&report, 0) else {
-//!     panic!("INIT is answered by the transport");
-//! };
-//! assert_eq!((cid, command, payload.len()), (BROADCAST_CID, Command::Init, 17));
-//! let reports: Vec<_> = Frames::new(cid, command, payload).expect("fits").collect();
-//! assert_eq!(reports.len(), 1);
+//! assert_eq!(transport.receive(&report, 0), Event::None);
+//! // The INIT response is one report on the broadcast channel, then nothing is left to send.
+//! let response = transport.next_report(0).expect("INIT is answered by the transport");
+//! assert_eq!((&response[..4], response[4], response[6]), (&[0xFF; 4][..], 0x86, 17));
+//! assert_eq!(transport.next_report(0), None);
 //! ```
 
+use core::borrow::BorrowMut;
 use core::num::NonZeroU64;
 
 use zeroize::Zeroize;
@@ -43,11 +44,21 @@ pub const BROADCAST_CID: u32 = 0xFFFF_FFFF;
 /// Largest payload the framing can carry: `64 - 7 + 128 * (64 - 5)` (§11.2.4).
 pub const MAX_MESSAGE_SIZE: usize = INIT_DATA + 128 * CONT_DATA;
 
-/// Default time allowed between two packets of one request before it is abandoned; see
-/// [`Transport::with_packet_timeout`]. §11.2.5.2 requires a timeout without fixing it. Hosts
-/// send the packets of a message back to back, so the margin is only for host scheduling and
-/// USB latency; 500 ms leaves plenty, and a stalled channel still frees the device quickly.
+/// Default time allowed between two packets of one request before it is abandoned, and between
+/// two reports of a response before the host is considered gone; see
+/// [`Transport::with_packet_timeout`]. §11.2.5.2 requires a timeout without fixing it. Hosts send
+/// the packets of a message back to back and read responses as they come, so the margin is only
+/// for host scheduling and USB latency; 500 ms leaves plenty, and a stalled channel still frees
+/// the device quickly.
 pub const DEFAULT_PACKET_TIMEOUT_MS: NonZeroU64 = NonZeroU64::new(500).expect("non-zero");
+
+/// Longest gap between two keepalives while a request is processed (§11.2.9.1.7: "at least every
+/// 100ms").
+pub const KEEPALIVE_INTERVAL_MS: u64 = 100;
+
+/// A keepalive is scheduled once half the interval has passed, so a device polling on a 100 ms
+/// timer sends one on every tick even when the tick comes a little early.
+const KEEPALIVE_DUE_MS: u64 = KEEPALIVE_INTERVAL_MS / 2;
 
 /// CTAPHID protocol version reported by INIT (§11.2.9.1.3).
 const PROTOCOL_VERSION: u8 = 2;
@@ -67,6 +78,11 @@ const INIT_BIT: u8 = 0x80;
 /// INIT request nonce length and response length (§11.2.9.1.3).
 const NONCE_LEN: usize = 8;
 const INIT_RESPONSE_LEN: usize = 17;
+
+/// Transport errors waiting for the endpoint. Errors only arise from host packets, at most one
+/// per packet, and the queue drains one report per endpoint completion; a host that floods the
+/// device faster than it reads loses the overflow, which it would time out on anyway.
+const ERROR_QUEUE: usize = 4;
 
 /// CTAPHID command codes (§11.2.9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,30 +212,19 @@ const CAPABILITY_CBOR: u8 = 0x04;
 /// The device does NOT implement `CTAPHID_MSG` (§11.2.9.1.3).
 const CAPABILITY_NMSG: u8 = 0x08;
 
-/// What one received report asks the caller to do.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Event<'a> {
-    /// Nothing to send: a packet of an incomplete request, or one that is ignored.
+/// What one received report means for the CTAP layer. Transport-level answers (INIT, PING echo,
+/// ERROR) never show up here: they are queued for [`Transport::next_report`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// Nothing for the CTAP layer.
     None,
-    /// A transport-level response (INIT, PING echo, ERROR) to send now with [`Frames`]; it ends
-    /// its transaction.
-    Reply {
-        /// Channel to answer on.
-        cid: u32,
-        /// Command of the response.
-        command: Command,
-        /// Response payload.
-        payload: &'a [u8],
-    },
-    /// A complete `CTAPHID_MSG` or `CTAPHID_CBOR` request for the CTAP layer. The device stays
-    /// busy for this channel until [`Transport::finish`].
+    /// A complete `CTAPHID_MSG` or `CTAPHID_CBOR` request, readable through
+    /// [`Transport::request`] until [`Transport::respond`] answers it.
     Request {
         /// Channel of the request.
         cid: u32,
         /// `Command::Msg` or `Command::Cbor`.
         command: Command,
-        /// Request payload.
-        payload: &'a [u8],
     },
     /// `CTAPHID_CANCEL` for the request being processed on `cid`: the CTAP layer ends it with
     /// `CTAP2_ERR_KEEPALIVE_CANCEL` (§11.2.9.1.5). Never answered by itself.
@@ -227,6 +232,25 @@ pub enum Event<'a> {
         /// Channel of the cancelled request.
         cid: u32,
     },
+}
+
+/// Why [`Transport::respond`] did not take a response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RespondError {
+    /// No request is waiting for an answer: it was aborted (INIT on its channel, §11.2.5.3) or
+    /// already answered.
+    NotActive,
+    /// The response is longer than the transport buffer.
+    TooLong,
+}
+
+/// The next report of a message being sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cursor {
+    /// The initialization packet.
+    Init,
+    /// The continuation packet with sequence `seq`, starting at payload byte `offset`.
+    Cont { seq: u8, offset: usize },
 }
 
 /// Transaction state (§11.2.5.1).
@@ -242,53 +266,110 @@ enum State {
         next_seq: u8,
         last_packet_ms: u64,
     },
-    /// A request handed to the CTAP layer and not answered yet.
+    /// A request handed to the CTAP layer and not answered yet; its `len` bytes are in the
+    /// buffer.
     Processing {
         cid: u32,
+        /// `Command::Msg` or `Command::Cbor`; the response carries the same command.
+        command: Command,
+        len: usize,
+        status: KeepaliveStatus,
+        last_keepalive_ms: u64,
+    },
+    /// A response of `len` bytes in the buffer, sent report by report.
+    Sending {
+        cid: u32,
+        command: Command,
+        len: usize,
+        next: Cursor,
+        last_progress_ms: u64,
     },
 }
 
-/// CTAPHID receiver: reassembles requests up to `N` bytes and keeps channel and busy state.
+/// Single-report error responses waiting for the endpoint, oldest first.
+#[derive(Clone, Copy, Debug)]
+struct ErrorQueue {
+    entries: [(u32, ErrorCode); ERROR_QUEUE],
+    len: usize,
+}
+
+impl ErrorQueue {
+    const fn new() -> Self {
+        Self {
+            entries: [(0, ErrorCode::Other); ERROR_QUEUE],
+            len: 0,
+        }
+    }
+
+    /// Queues an error; a full queue drops it (see [`ERROR_QUEUE`]).
+    fn push(&mut self, cid: u32, code: ErrorCode) {
+        if let Some(slot) = self.entries.get_mut(self.len) {
+            *slot = (cid, code);
+            self.len = self.len.checked_add(1).expect("len < ERROR_QUEUE here");
+        }
+    }
+
+    /// Takes the oldest error not addressed to `held`, whose errors wait for its response to end.
+    fn pop_except(&mut self, held: Option<u32>) -> Option<(u32, ErrorCode)> {
+        let queued = self.entries.get(..self.len)?;
+        let index = queued.iter().position(|&(cid, _)| Some(cid) != held)?;
+        let entry = queued[index];
+        let next = index.checked_add(1).expect("index < len <= ERROR_QUEUE");
+        self.entries.copy_within(next..self.len, index);
+        self.len = self.len.checked_sub(1).expect("the queue held `entry`");
+        Some(entry)
+    }
+}
+
+/// CTAPHID transport: reassembles requests up to `N` bytes, keeps channel and busy state, and
+/// produces every report the device sends.
 ///
 /// `N` is the device buffer, reported as `maxMsgSize`; it is at least one report's payload and
-/// at most [`MAX_MESSAGE_SIZE`].
-pub struct Transport<const N: usize> {
-    buffer: [u8; N],
-    /// Leading bytes of `buffer` that may still hold request data.
+/// at most [`MAX_MESSAGE_SIZE`]. The same buffer holds a request, then its response. The buffer
+/// is the caller's: an array owned by the transport, or a mutable reference to one, so a device
+/// can keep a large buffer in zero-initialized static memory instead of building it on its stack.
+pub struct Transport<const N: usize, S: BorrowMut<[u8; N]> = [u8; N]> {
+    buffer: S,
+    /// Leading bytes of `buffer` that may still hold message data.
     dirty: usize,
-    reply: [u8; INIT_RESPONSE_LEN],
     state: State,
+    errors: ErrorQueue,
+    /// A keepalive for the request being processed waits for the endpoint.
+    keepalive_pending: bool,
     last_cid: u32,
     info: DeviceInfo,
     packet_timeout_ms: u64,
 }
 
-impl<const N: usize> Drop for Transport<N> {
+impl<const N: usize, S: BorrowMut<[u8; N]>> Drop for Transport<N, S> {
     fn drop(&mut self) {
         self.wipe();
     }
 }
 
-impl<const N: usize> Transport<N> {
+impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
     const SIZE_IN_RANGE: () = assert!(N >= INIT_DATA && N <= MAX_MESSAGE_SIZE);
 
-    /// Creates an idle transport with no channel allocated and the
-    /// [`DEFAULT_PACKET_TIMEOUT_MS`] packet timeout.
-    pub const fn new(info: DeviceInfo) -> Self {
+    /// Creates an idle transport over `buffer`, with no channel allocated and the
+    /// [`DEFAULT_PACKET_TIMEOUT_MS`] packet timeout. The buffer's previous content is never
+    /// read: every message is written before it is used.
+    pub const fn new(info: DeviceInfo, buffer: S) -> Self {
         let () = Self::SIZE_IN_RANGE;
         Self {
-            buffer: [0; N],
+            buffer,
             dirty: 0,
-            reply: [0; INIT_RESPONSE_LEN],
             state: State::Idle,
+            errors: ErrorQueue::new(),
+            keepalive_pending: false,
             last_cid: 0,
             info,
             packet_timeout_ms: DEFAULT_PACKET_TIMEOUT_MS.get(),
         }
     }
 
-    /// Sets the time allowed between two packets of one request; a message whose next packet
-    /// comes this late or later is abandoned with `ERR_MSG_TIMEOUT` (§11.2.5.2).
+    /// Sets the time allowed between two packets of one request, and between two reports of a
+    /// response; a message whose next packet comes this late or later is abandoned with
+    /// `ERR_MSG_TIMEOUT` (§11.2.5.2), a response the host stopped reading is dropped.
     ///
     /// # Examples
     ///
@@ -298,7 +379,7 @@ impl<const N: usize> Transport<N> {
     ///
     /// let info = DeviceInfo { version: [0, 1, 0], cbor: true, msg: false };
     /// let timeout = NonZeroU64::new(750).expect("non-zero");
-    /// let transport = Transport::<1024>::new(info).with_packet_timeout(timeout);
+    /// let transport = Transport::<1024>::new(info, [0; 1024]).with_packet_timeout(timeout);
     /// assert_eq!(transport.packet_timeout_ms(), 750);
     /// ```
     #[must_use]
@@ -307,32 +388,72 @@ impl<const N: usize> Transport<N> {
         self
     }
 
-    /// Time allowed between two packets of one request, in milliseconds.
+    /// Time allowed between two packets of one message, in milliseconds.
     pub const fn packet_timeout_ms(&self) -> u64 {
         self.packet_timeout_ms
     }
 
-    /// Zeroes the request bytes held in the buffer: a request can carry PIN/UV material.
+    /// Largest request accepted, in bytes.
+    pub const fn max_message_size(&self) -> usize {
+        N
+    }
+
+    /// Forgets every channel, transaction and queued report, as when the device is reset on the
+    /// bus: hosts allocate their channels again (§11.2.3) and nothing stale is sent.
+    pub fn restart(&mut self) {
+        self.reset();
+        self.errors = ErrorQueue::new();
+        self.last_cid = 0;
+    }
+
+    /// Zeroes the message bytes held in the buffer: a request can carry PIN/UV material.
     fn wipe(&mut self) {
-        self.buffer[..self.dirty].zeroize();
+        let dirty = self.dirty;
+        self.bytes_mut()[..dirty].zeroize();
         self.dirty = 0;
+    }
+
+    fn bytes(&self) -> &[u8; N] {
+        self.buffer.borrow()
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8; N] {
+        self.buffer.borrow_mut()
     }
 
     /// Ends the current transaction and wipes its data.
     fn reset(&mut self) {
         self.state = State::Idle;
+        self.keepalive_pending = false;
         self.wipe();
     }
 
-    /// Records that the first `end` bytes of the buffer now hold request data.
+    /// Records that the first `end` bytes of the buffer now hold message data.
     fn mark_dirty(&mut self, end: usize) {
         self.dirty = self.dirty.max(end);
     }
 
     /// A broken internal invariant: the transaction is dropped and the channel told so.
-    fn broken(&mut self, cid: u32) -> Event<'_> {
+    fn broken(&mut self, cid: u32) -> Event {
         self.reset();
         self.error(cid, ErrorCode::Other)
+    }
+
+    fn error(&mut self, cid: u32, code: ErrorCode) -> Event {
+        self.errors.push(cid, code);
+        Event::None
+    }
+
+    /// Starts sending the `len`-byte message in the buffer; the device stays busy until its last
+    /// report is handed out.
+    fn send(&mut self, cid: u32, command: Command, len: usize, now_ms: u64) {
+        self.state = State::Sending {
+            cid,
+            command,
+            len,
+            next: Cursor::Init,
+            last_progress_ms: now_ms,
+        };
     }
 
     /// Abandons a message whose next packet is late (§11.2.5.2) and returns its channel.
@@ -345,59 +466,164 @@ impl<const N: usize> Transport<N> {
         else {
             return None;
         };
-        // A clock that went backwards abandons the message too: its age is unknown.
-        let expired = now_ms
-            .checked_sub(last_packet_ms)
-            .is_none_or(|age| age >= self.packet_timeout_ms);
-        if !expired {
+        if !self.late(last_packet_ms, now_ms) {
             return None;
         }
         self.reset();
         Some(cid)
     }
 
-    /// Largest request accepted, in bytes.
-    pub const fn max_message_size(&self) -> usize {
-        N
+    /// Whether `now_ms` is at least the packet timeout after `since_ms`. A clock that went
+    /// backwards counts as late: the age is unknown.
+    fn late(&self, since_ms: u64, now_ms: u64) -> bool {
+        now_ms
+            .checked_sub(since_ms)
+            .is_none_or(|age| age >= self.packet_timeout_ms)
     }
 
-    /// Channel of the request handed out by [`Event::Request`] and not finished yet; `None`
+    /// Channel of the request handed out by [`Event::Request`] and not answered yet; `None`
     /// once it was answered, aborted by INIT, or never existed.
     pub fn active(&self) -> Option<u32> {
         match self.state {
-            State::Processing { cid } => Some(cid),
+            State::Processing { cid, .. } => Some(cid),
             _ => None,
         }
     }
 
-    /// Marks the request of [`Transport::active`] as answered; the device becomes idle and the
-    /// request bytes are wiped.
-    pub fn finish(&mut self) {
-        if matches!(self.state, State::Processing { .. }) {
-            self.reset();
+    /// The payload of the request waiting for an answer.
+    pub fn request(&self) -> Option<&[u8]> {
+        match self.state {
+            State::Processing { len, .. } => self.bytes().get(..len),
+            _ => None,
         }
     }
 
-    /// Called by the device loop without a report, at least as often as keepalives are sent:
-    /// times out a stalled message at its deadline (§11.2.5.2) and wipes the data of a reply
-    /// already sent.
-    pub fn poll(&mut self, now_ms: u64) -> Event<'_> {
-        if self.state == State::Idle {
-            self.wipe();
+    /// Answers the active request with `payload`; the device stays busy until the last report of
+    /// the response has been handed out by [`Transport::next_report`].
+    ///
+    /// # Errors
+    ///
+    /// [`RespondError::NotActive`] when no request waits (the response is dropped),
+    /// [`RespondError::TooLong`] when `payload` exceeds the buffer (the request stays active so
+    /// the CTAP layer can answer with an error instead).
+    pub fn respond(&mut self, payload: &[u8], now_ms: u64) -> Result<(), RespondError> {
+        let State::Processing { cid, command, .. } = self.state else {
+            return Err(RespondError::NotActive);
+        };
+        let len = payload.len();
+        if len > N {
+            return Err(RespondError::TooLong);
         }
-        match self.expire(now_ms) {
-            Some(cid) => self.error(cid, ErrorCode::MsgTimeout),
-            None => Event::None,
+        // The request is consumed: its bytes go before the response takes their place.
+        self.wipe();
+        self.bytes_mut()[..len].copy_from_slice(payload);
+        self.mark_dirty(len);
+        self.keepalive_pending = false;
+        self.send(cid, command, len, now_ms);
+        Ok(())
+    }
+
+    /// Sets what keepalives report for the active request; a change is reported at once
+    /// (§11.2.9.1.7: "and whenever the status changes").
+    pub fn set_status(&mut self, new: KeepaliveStatus) {
+        if let State::Processing { status, .. } = &mut self.state
+            && *status != new
+        {
+            *status = new;
+            self.keepalive_pending = true;
         }
+    }
+
+    /// Called by the device loop without a report, at least every [`KEEPALIVE_INTERVAL_MS`]:
+    /// times out a stalled message at its deadline (§11.2.5.2), schedules keepalives for the
+    /// request being processed (§11.2.9.1.7) and drops a response the host stopped reading.
+    pub fn poll(&mut self, now_ms: u64) {
+        if let Some(cid) = self.expire(now_ms) {
+            self.error(cid, ErrorCode::MsgTimeout);
+            return;
+        }
+        match self.state {
+            State::Processing {
+                last_keepalive_ms, ..
+            } => {
+                // A clock that went backwards schedules one too: the gap is unknown.
+                let due = now_ms
+                    .checked_sub(last_keepalive_ms)
+                    .is_none_or(|gap| gap >= KEEPALIVE_DUE_MS);
+                if due
+                    && let State::Processing {
+                        last_keepalive_ms, ..
+                    } = &mut self.state
+                {
+                    *last_keepalive_ms = now_ms;
+                    self.keepalive_pending = true;
+                }
+            }
+            State::Sending {
+                last_progress_ms, ..
+            } => {
+                if self.late(last_progress_ms, now_ms) {
+                    self.reset();
+                }
+            }
+            State::Idle | State::Assembling { .. } => {}
+        }
+    }
+
+    /// The next report to send, once the endpoint is free: queued errors first, then a due
+    /// keepalive, then the next report of the response being sent. An error for the channel
+    /// whose response is being sent waits until that response is out, so the channel's own
+    /// message is never split by another initialization packet (§11.2.4). `None` when nothing
+    /// waits.
+    pub fn next_report(&mut self, now_ms: u64) -> Option<Report> {
+        let sending = match self.state {
+            State::Sending { cid, .. } => Some(cid),
+            _ => None,
+        };
+        if let Some((cid, code)) = self.errors.pop_except(sending) {
+            return Some(error_report(cid, code));
+        }
+        if let State::Processing { cid, status, .. } = self.state
+            && self.keepalive_pending
+        {
+            self.keepalive_pending = false;
+            return Some(keepalive_report(cid, status));
+        }
+        let State::Sending {
+            cid,
+            command,
+            len,
+            next,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
+        if len > N {
+            // `len <= N` whenever a message is sent; a violation drops it.
+            self.reset();
+            return None;
+        }
+        let (report, following) = frame(cid, command, &self.bytes()[..len], next);
+        match following {
+            Some(next) => {
+                self.state = State::Sending {
+                    cid,
+                    command,
+                    len,
+                    next,
+                    last_progress_ms: now_ms,
+                };
+            }
+            // The last report is out: the transaction ends and its data goes.
+            None => self.reset(),
+        }
+        Some(report)
     }
 
     /// Handles one report received at `now_ms` (a monotonic millisecond clock).
-    pub fn receive(&mut self, report: &Report, now_ms: u64) -> Event<'_> {
+    pub fn receive(&mut self, report: &Report, now_ms: u64) -> Event {
         let cid = u32::from_be_bytes([report[0], report[1], report[2], report[3]]);
-        if self.state == State::Idle {
-            // The previous reply (a PING echo) has been sent by now.
-            self.wipe();
-        }
         // §11.2.5.2: the late packet of an abandoned message learns why.
         if self.expire(now_ms) == Some(cid) && report[4] & INIT_BIT == 0 {
             return self.error(cid, ErrorCode::MsgTimeout);
@@ -409,7 +635,7 @@ impl<const N: usize> Transport<N> {
         }
     }
 
-    fn continuation(&mut self, cid: u32, report: &Report, now_ms: u64) -> Event<'_> {
+    fn continuation(&mut self, cid: u32, report: &Report, now_ms: u64) -> Event {
         let State::Assembling {
             cid: active,
             command,
@@ -442,9 +668,10 @@ impl<const N: usize> Transport<N> {
         else {
             return self.broken(cid);
         };
-        let (Some(target), Some(source)) =
-            (self.buffer.get_mut(filled..end), report.get(5..source_end))
-        else {
+        let (Some(target), Some(source)) = (
+            self.bytes_mut().get_mut(filled..end),
+            report.get(5..source_end),
+        ) else {
             return self.broken(cid);
         };
         target.copy_from_slice(source);
@@ -464,11 +691,10 @@ impl<const N: usize> Transport<N> {
             };
             return Event::None;
         }
-        self.state = State::Idle;
-        self.complete(cid, command, len)
+        self.complete(cid, command, len, now_ms)
     }
 
-    fn initialization(&mut self, cid: u32, report: &Report, now_ms: u64) -> Event<'_> {
+    fn initialization(&mut self, cid: u32, report: &Report, now_ms: u64) -> Event {
         let code = report[4] & !INIT_BIT;
         let len = usize::from(u16::from_be_bytes([report[5], report[6]]));
         let command = Command::try_from(code);
@@ -481,7 +707,7 @@ impl<const N: usize> Transport<N> {
         }
 
         match self.state {
-            State::Processing { cid: active } if cid == active => {
+            State::Processing { cid: active, .. } if cid == active => {
                 return match command {
                     Ok(Command::Cancel) => Event::Cancel { cid },
                     // §11.2.5.3: INIT on the active channel aborts its transaction.
@@ -490,6 +716,18 @@ impl<const N: usize> Transport<N> {
                         self.start(cid, Command::Init, len, report, now_ms)
                     }
                     // The channel's own request is still being processed.
+                    _ => self.error(cid, ErrorCode::ChannelBusy),
+                };
+            }
+            State::Sending { cid: active, .. } if cid == active => {
+                return match command {
+                    // The answer is already on its way: there is nothing left to cancel.
+                    Ok(Command::Cancel) => Event::None,
+                    // §11.2.5.3: INIT aborts the transaction, its response included.
+                    Ok(Command::Init) => {
+                        self.reset();
+                        self.start(cid, Command::Init, len, report, now_ms)
+                    }
                     _ => self.error(cid, ErrorCode::ChannelBusy),
                 };
             }
@@ -503,7 +741,7 @@ impl<const N: usize> Transport<N> {
                     _ => return self.error(cid, ErrorCode::InvalidSeq),
                 }
             }
-            State::Processing { .. } | State::Assembling { .. } => {
+            State::Processing { .. } | State::Sending { .. } | State::Assembling { .. } => {
                 // §11.2.9.1.5: CANCEL on a non-active channel is ignored.
                 if cancel {
                     return Event::None;
@@ -543,7 +781,7 @@ impl<const N: usize> Transport<N> {
         len: usize,
         report: &Report,
         now_ms: u64,
-    ) -> Event<'_> {
+    ) -> Event {
         // Only what INIT advertises is accepted: the optional LOCK and WINK (left out, see
         // `DeviceInfo`), device-to-host commands, CANCEL (handled before any request starts) and a
         // disabled MSG or CBOR are not.
@@ -561,7 +799,7 @@ impl<const N: usize> Transport<N> {
         let source_end = 7usize
             .checked_add(take)
             .expect("take is at most INIT_DATA, so it ends within the report");
-        self.buffer[..take].copy_from_slice(&report[7..source_end]);
+        self.bytes_mut()[..take].copy_from_slice(&report[7..source_end]);
         self.mark_dirty(take);
         if take < len {
             self.state = State::Assembling {
@@ -574,25 +812,27 @@ impl<const N: usize> Transport<N> {
             };
             return Event::None;
         }
-        self.complete(cid, command, len)
+        self.complete(cid, command, len, now_ms)
     }
 
     /// Answers or hands out a fully received request of `len` bytes in the buffer.
-    fn complete(&mut self, cid: u32, command: Command, len: usize) -> Event<'_> {
+    fn complete(&mut self, cid: u32, command: Command, len: usize, now_ms: u64) -> Event {
         match command {
-            Command::Init => self.init(cid),
-            Command::Ping => Event::Reply {
-                cid,
-                command: Command::Ping,
-                payload: &self.buffer[..len],
-            },
+            Command::Init => self.init(cid, now_ms),
+            // The echo is the request itself, already in the buffer.
+            Command::Ping => {
+                self.send(cid, Command::Ping, len, now_ms);
+                Event::None
+            }
             Command::Msg | Command::Cbor => {
-                self.state = State::Processing { cid };
-                Event::Request {
+                self.state = State::Processing {
                     cid,
                     command,
-                    payload: &self.buffer[..len],
-                }
+                    len,
+                    status: KeepaliveStatus::Processing,
+                    last_keepalive_ms: now_ms,
+                };
+                Event::Request { cid, command }
             }
             // `start` lets only the four commands above assemble.
             Command::Lock
@@ -604,8 +844,8 @@ impl<const N: usize> Transport<N> {
     }
 
     /// Answers INIT: allocates a channel on the broadcast channel, or confirms the channel it was
-    /// received on (§11.2.9.1.3).
-    fn init(&mut self, cid: u32) -> Event<'_> {
+    /// received on (§11.2.9.1.3). The response replaces the nonce in the buffer.
+    fn init(&mut self, cid: u32, now_ms: u64) -> Event {
         let channel = if cid == BROADCAST_CID {
             match self.last_cid.checked_add(1) {
                 Some(next) if next != BROADCAST_CID => {
@@ -613,125 +853,76 @@ impl<const N: usize> Transport<N> {
                     next
                 }
                 // Every channel identifier is taken; only a restart frees them.
-                _ => return self.error(cid, ErrorCode::Other),
+                _ => {
+                    self.reset();
+                    return self.error(cid, ErrorCode::Other);
+                }
             }
         } else {
             cid
         };
-        self.reply[..NONCE_LEN].copy_from_slice(&self.buffer[..NONCE_LEN]);
-        self.reply[8..12].copy_from_slice(&channel.to_be_bytes());
-        self.reply[12] = PROTOCOL_VERSION;
-        self.reply[13..16].copy_from_slice(&self.info.version);
-        self.reply[16] = self.info.capabilities();
-        Event::Reply {
-            cid,
-            command: Command::Init,
-            payload: &self.reply,
-        }
-    }
-
-    fn error(&mut self, cid: u32, code: ErrorCode) -> Event<'_> {
-        self.reply[0] = code as u8;
-        Event::Reply {
-            cid,
-            command: Command::Error,
-            payload: &self.reply[..1],
-        }
+        // The nonce stays in bytes 0..8, where the response starts with it.
+        let (version, capabilities) = (self.info.version, self.info.capabilities());
+        let response = self.bytes_mut();
+        response[8..12].copy_from_slice(&channel.to_be_bytes());
+        response[12] = PROTOCOL_VERSION;
+        response[13..16].copy_from_slice(&version);
+        response[16] = capabilities;
+        self.mark_dirty(INIT_RESPONSE_LEN);
+        self.send(cid, Command::Init, INIT_RESPONSE_LEN, now_ms);
+        Event::None
     }
 }
 
-/// A response payload too long for CTAPHID framing ([`MAX_MESSAGE_SIZE`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TooLong;
-
-/// Reports of one response message, in order (§11.2.4); unused bytes are zero.
-#[derive(Debug)]
-pub struct Frames<'a> {
-    cid: u32,
-    command: Command,
-    payload: &'a [u8],
-    offset: usize,
-    seq: Option<u8>,
+/// The report at `cursor` of the `command` message carrying `payload` on `cid` (§11.2.4), and
+/// the cursor of the following report, `None` after the last one. Unused bytes are zero.
+fn frame(cid: u32, command: Command, payload: &[u8], cursor: Cursor) -> (Report, Option<Cursor>) {
+    let mut report = [0u8; REPORT_SIZE];
+    report[..4].copy_from_slice(&cid.to_be_bytes());
+    let (offset, take, header) = match cursor {
+        Cursor::Init => {
+            report[4] = command as u8 | INIT_BIT;
+            let len = u16::try_from(payload.len())
+                .expect("messages are at most MAX_MESSAGE_SIZE, which fits in BCNT");
+            report[5..7].copy_from_slice(&len.to_be_bytes());
+            (0, payload.len().min(INIT_DATA), 7usize)
+        }
+        Cursor::Cont { seq, offset } => {
+            report[4] = seq;
+            let remaining = payload
+                .len()
+                .checked_sub(offset)
+                .expect("a cursor never passes the payload length");
+            (offset, remaining.min(CONT_DATA), 5)
+        }
+    };
+    let end = offset
+        .checked_add(take)
+        .expect("offset + take stays within the payload length");
+    let report_end = header
+        .checked_add(take)
+        .expect("take fits the packet after its header");
+    report[header..report_end].copy_from_slice(&payload[offset..end]);
+    if end >= payload.len() {
+        return (report, None);
+    }
+    let seq = match cursor {
+        Cursor::Init => 0,
+        // A payload of at most MAX_MESSAGE_SIZE ends by sequence MAX_SEQ, so a continuation
+        // that is not the last one has a sequence below it.
+        Cursor::Cont { seq, .. } => seq.checked_add(1).expect("sequence below MAX_SEQ here"),
+    };
+    (report, Some(Cursor::Cont { seq, offset: end }))
 }
 
-impl<'a> Frames<'a> {
-    /// Splits `payload` into the reports of a `command` response on `cid`.
-    ///
-    /// # Errors
-    ///
-    /// [`TooLong`] when the payload exceeds [`MAX_MESSAGE_SIZE`].
-    pub fn new(cid: u32, command: Command, payload: &'a [u8]) -> Result<Self, TooLong> {
-        if payload.len() > MAX_MESSAGE_SIZE {
-            return Err(TooLong);
-        }
-        Ok(Self {
-            cid,
-            command,
-            payload,
-            offset: 0,
-            seq: None,
-        })
-    }
-}
-
-impl Iterator for Frames<'_> {
-    type Item = Report;
-
-    fn next(&mut self) -> Option<Report> {
-        let mut report = [0u8; REPORT_SIZE];
-        report[..4].copy_from_slice(&self.cid.to_be_bytes());
-        match self.seq {
-            None => {
-                report[4] = self.command as u8 | INIT_BIT;
-                let len = u16::try_from(self.payload.len())
-                    .expect("new bounds the payload by MAX_MESSAGE_SIZE, which fits in BCNT");
-                report[5..7].copy_from_slice(&len.to_be_bytes());
-                let take = self.payload.len().min(INIT_DATA);
-                let report_end = 7usize
-                    .checked_add(take)
-                    .expect("take is at most INIT_DATA, so it ends within the report");
-                report[7..report_end].copy_from_slice(&self.payload[..take]);
-                self.offset = take;
-                self.seq = Some(0);
-            }
-            Some(seq) => {
-                if self.offset >= self.payload.len() {
-                    return None;
-                }
-                debug_assert!(seq <= MAX_SEQ, "payload bounded by MAX_MESSAGE_SIZE");
-                report[4] = seq;
-                let take = self
-                    .payload
-                    .len()
-                    .checked_sub(self.offset)
-                    .expect("offset never passes the payload length")
-                    .min(CONT_DATA);
-                let end = self
-                    .offset
-                    .checked_add(take)
-                    .expect("offset + take stays within the payload length");
-                let report_end = 5usize
-                    .checked_add(take)
-                    .expect("take is at most CONT_DATA, so it ends within the report");
-                report[5..report_end].copy_from_slice(&self.payload[self.offset..end]);
-                self.offset = end;
-                // A payload of at most MAX_MESSAGE_SIZE ends by sequence MAX_SEQ (0x7F), so the
-                // next value is at most 0x80 and is never written: the payload is exhausted.
-                self.seq = Some(seq.checked_add(1).expect("sequence is at most MAX_SEQ"));
-            }
-        }
-        Some(report)
-    }
+/// A one-report `CTAPHID_ERROR` response (§11.2.9.1.6).
+fn error_report(cid: u32, code: ErrorCode) -> Report {
+    frame(cid, Command::Error, &[code as u8], Cursor::Init).0
 }
 
 /// The keepalive report sent on `cid` while a request waits (§11.2.9.1.7).
-pub fn keepalive(cid: u32, status: KeepaliveStatus) -> Report {
-    let mut report = [0u8; REPORT_SIZE];
-    report[..4].copy_from_slice(&cid.to_be_bytes());
-    report[4] = Command::Keepalive as u8 | INIT_BIT;
-    report[6] = 1;
-    report[7] = status as u8;
-    report
+fn keepalive_report(cid: u32, status: KeepaliveStatus) -> Report {
+    frame(cid, Command::Keepalive, &[status as u8], Cursor::Init).0
 }
 
 #[cfg(test)]

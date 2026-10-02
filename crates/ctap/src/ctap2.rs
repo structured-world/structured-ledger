@@ -212,15 +212,37 @@ impl TryFrom<u16> for MaxMsgSize {
     type Error = TooSmall;
 
     fn try_from(size: u16) -> Result<Self, TooSmall> {
+        Self::new(size)
+    }
+}
+
+impl MaxMsgSize {
+    /// The size `size`, in a `const` context too.
+    ///
+    /// # Errors
+    ///
+    /// [`TooSmall`] below [`MIN_MESSAGE_SIZE`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_passkeys_ctap::ctap2::{MaxMsgSize, TooSmall};
+    ///
+    /// const SIZE: MaxMsgSize = match MaxMsgSize::new(7609) {
+    ///     Ok(size) => size,
+    ///     Err(_) => panic!("at least 1024"),
+    /// };
+    /// assert_eq!(SIZE.get(), 7609);
+    /// assert_eq!(MaxMsgSize::new(1023), Err(TooSmall(1023)));
+    /// ```
+    pub const fn new(size: u16) -> Result<Self, TooSmall> {
         if size >= MIN_MESSAGE_SIZE {
             Ok(Self(size))
         } else {
             Err(TooSmall(size))
         }
     }
-}
 
-impl MaxMsgSize {
     /// The size in bytes.
     pub const fn get(self) -> u16 {
         self.0
