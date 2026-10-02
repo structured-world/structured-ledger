@@ -9,7 +9,7 @@
 # Linux only: the image is a Linux container.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-image=ghcr.io/ledgerhq/ledger-app-builder/ledger-app-dev-tools:latest
+image=$("$root/scripts/dev-tools-image.sh")
 
 docker pull --quiet "$image" >/dev/null
 docker run --rm \
