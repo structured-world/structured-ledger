@@ -268,10 +268,11 @@ impl<'a> Decoder<'a> {
         let start = self.input;
         match self.head()? {
             (Major::Unsigned, value) => i64::try_from(value).map_err(|_| Error::UnexpectedType),
-            // -1 - n, computed without overflow for every n that fits.
+            // -1 - n; an argument whose value does not fit i64 is outside the range read here.
             (Major::Negative, value) => i64::try_from(value)
-                .map(|n| -1 - n)
-                .map_err(|_| Error::UnexpectedType),
+                .ok()
+                .and_then(|n| (-1i64).checked_sub(n))
+                .ok_or(Error::UnexpectedType),
             _ => Err(self.mismatch(start)),
         }
     }
@@ -613,8 +614,13 @@ impl<'b> Encoder<'b> {
     pub fn int(&mut self, value: i64) -> Result<&mut Self, Full> {
         match u64::try_from(value) {
             Ok(unsigned) => self.head(Major::Unsigned, unsigned),
-            // -1 - value is in 0..=i64::MAX for every negative value.
-            Err(_) => self.head(Major::Negative, (-1 - value) as u64),
+            Err(_) => {
+                let argument = (-1i64)
+                    .checked_sub(value)
+                    .and_then(|n| u64::try_from(n).ok())
+                    .expect("-1 - value is in 0..=i64::MAX for a negative value");
+                self.head(Major::Negative, argument)
+            }
         }
     }
 
