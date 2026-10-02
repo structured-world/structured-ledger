@@ -10,11 +10,21 @@ publish = false
 
 [dependencies]
 zeroize = { version = "1.9.0", default-features = false }
+# Software implementation of the crypto platform for host tests and fuzzing (`soft`).
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes"], optional = true }
+hmac = { version = "0.13.0", default-features = false, optional = true }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "arithmetic"], optional = true }
+sha2 = { version = "0.11.0", default-features = false, optional = true }
+
+[dev-dependencies]
+structured-passkeys-ctap = { path = ".", features = ["soft"] }
 
 [features]
 default = ["std"]
 # Host users; the device build uses `--no-default-features`.
 std = []
+# The software `Crypto` of `soft`, for host tests and fuzzing; never in the device build.
+soft = ["dep:aes-gcm", "dep:hmac", "dep:p256", "dep:sha2"]
 
 [lints]
 workspace = true
