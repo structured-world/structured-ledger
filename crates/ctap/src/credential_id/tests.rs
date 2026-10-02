@@ -260,7 +260,7 @@ fn long_names_are_cut_on_a_character_boundary() {
     );
 }
 
-/// A user ID must be 1..=64 bytes (WebAuthn L3, user handle).
+/// A user ID must be 1..=64 bytes (WebAuthn L3 §5.1.3 step 5).
 #[test]
 fn user_ids_outside_one_to_64_bytes_are_refused() {
     let (mut crypto, keys) = platform();
@@ -273,6 +273,19 @@ fn user_ids_outside_one_to_64_bytes_are_refused() {
             "{length}"
         );
     }
+}
+
+/// The credential seed is key material: Debug output, of the key source and of a whole
+/// credential, never prints it, so a log line cannot leak a private key.
+#[test]
+fn debug_output_redacts_the_credential_seed() {
+    assert_eq!(
+        format!("{:?}", KeySource::Seed([0x33; 32])),
+        "Seed(<redacted>)"
+    );
+    let credential = format!("{:?}", seed_credential());
+    assert!(credential.contains("Seed(<redacted>)"), "{credential}");
+    assert!(!credential.contains("51"), "{credential}");
 }
 
 /// The largest credential (all fields at their maximum) fits MAX_CREDENTIAL_ID_LEN and opens.

@@ -1,5 +1,6 @@
 //! HKDF against the RFC 5869 Appendix A vectors and the P-256 private-key range check at its
-//! boundaries. Expected bytes are copied from the specifications.
+//! boundaries. Expected bytes are copied from the specifications. Also the software platform's
+//! redacted Debug output.
 
 use super::{KEY_LEN, hkdf_sha256, is_p256_private_key};
 use crate::soft::SoftCrypto;
@@ -65,4 +66,12 @@ fn p256_private_keys_are_between_zero_and_the_order() {
     let mut high = [0u8; KEY_LEN];
     high[0] = 0x7F;
     assert!(is_p256_private_key(&high), "0x7f00..00");
+}
+
+/// The software platform's node derives every key and its seed predicts every nonce: Debug
+/// output prints neither.
+#[test]
+fn soft_crypto_debug_output_hides_the_node_and_the_seed() {
+    let debug = format!("{:?}", crypto());
+    assert_eq!(debug, "SoftCrypto { counter: 0, .. }");
 }

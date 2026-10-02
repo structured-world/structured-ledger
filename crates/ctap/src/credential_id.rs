@@ -9,6 +9,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::cbor::{self, Decoder, Encoder, Entries, Key};
@@ -17,7 +18,7 @@ use crate::keys::KeyRing;
 
 /// The format version this module writes and opens.
 pub const VERSION: u8 = 0x01;
-/// Longest user ID (WebAuthn L3, `PublicKeyCredentialUserEntity.id`: at most 64 bytes).
+/// Longest user ID: WebAuthn L3 §5.1.3 step 5 refuses a `user.id` outside 1..=64 bytes.
 pub const MAX_USER_ID_LEN: usize = 64;
 /// Longest stored user name and display name, in bytes.
 pub const MAX_NAME_LEN: usize = 64;
@@ -42,8 +43,9 @@ const MAX_PLAINTEXT_LEN: usize = 1 // map of up to 11 entries
 /// Longest credential ID, reported as `maxCredentialIdLength`.
 pub const MAX_CREDENTIAL_ID_LEN: usize = 1 + NONCE_LEN + MAX_PLAINTEXT_LEN + TAG_LEN;
 
-/// Where the private key of a credential comes from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Where the private key of a credential comes from. Its `Debug` output never prints the
+/// credential seed.
+#[derive(Clone, PartialEq, Eq)]
 pub enum KeySource {
     /// Derived from the device seed and this credential seed: reproducible from the recovery
     /// phrase.
@@ -55,6 +57,20 @@ pub enum KeySource {
         /// The tag the slot held when the credential was created.
         tag: [u8; SLOT_TAG_LEN],
     },
+}
+
+impl fmt::Debug for KeySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // The seed derives the private key; the slot index and tag are not secret.
+            KeySource::Seed(_) => f.write_str("Seed(<redacted>)"),
+            KeySource::Slot { index, tag } => f
+                .debug_struct("Slot")
+                .field("index", index)
+                .field("tag", tag)
+                .finish(),
+        }
+    }
 }
 
 impl Drop for KeySource {
@@ -217,6 +233,7 @@ pub fn seal<C: Crypto>(
 ) -> Result<Vec<u8>, TooLong> {
     let mut credential = credential.clone();
     if let Some(user) = &mut credential.user {
+        // WebAuthn L3 §5.1.3 step 5: a user ID is 1..=64 bytes.
         if user.id.is_empty() || user.id.len() > MAX_USER_ID_LEN {
             return Err(TooLong);
         }
@@ -357,6 +374,7 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
                 return Err(NOT_A_CREDENTIAL);
             }
             let id = entries.value().bytes()?.to_vec();
+            // WebAuthn L3 §5.1.3 step 5: a user ID is 1..=64 bytes.
             if id.is_empty() || id.len() > MAX_USER_ID_LEN {
                 return Err(NOT_A_CREDENTIAL);
             }

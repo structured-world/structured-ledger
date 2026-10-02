@@ -3,6 +3,8 @@
 //! Its random numbers are SHA-256 in counter mode over a seed, so runs are reproducible; it is
 //! never a substitute for the device's TRNG.
 
+use core::fmt;
+
 use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use hmac::{Hmac, Mac};
@@ -13,12 +15,20 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{Crypto, CryptoError, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, Signature, TAG_LEN};
 
-/// Software cryptography with a fixed application node and a seeded generator.
-#[derive(Debug)]
+/// Software cryptography with a fixed application node and a seeded generator. Its `Debug`
+/// output never prints the node or the seed.
 pub struct SoftCrypto {
     node: [u8; KEY_LEN],
     seed: [u8; KEY_LEN],
     counter: u64,
+}
+
+impl fmt::Debug for SoftCrypto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SoftCrypto")
+            .field("counter", &self.counter)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SoftCrypto {
