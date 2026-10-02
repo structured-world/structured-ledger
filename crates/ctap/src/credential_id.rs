@@ -279,14 +279,17 @@ pub fn open<C: Crypto>(
     if id.len() < 1 + NONCE_LEN + TAG_LEN || id.len() > MAX_CREDENTIAL_ID_LEN {
         return Err(OpenError::Length);
     }
-    let (version, rest) = id.split_at(1);
-    if version[0] != VERSION {
+    // Checked splits: the host chose these bytes, so a short ID is refused, never sliced past.
+    let (&version, rest) = id.split_first().ok_or(OpenError::Length)?;
+    if version != VERSION {
         return Err(OpenError::Version);
     }
-    let (nonce, rest) = rest.split_at(NONCE_LEN);
-    let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
-    let nonce: &[u8; NONCE_LEN] = nonce.try_into().expect("split at NONCE_LEN");
-    let tag: &[u8; TAG_LEN] = tag.try_into().expect("split at TAG_LEN from the end");
+    let (nonce, rest) = rest
+        .split_first_chunk::<NONCE_LEN>()
+        .ok_or(OpenError::Length)?;
+    let (ciphertext, tag) = rest
+        .split_last_chunk::<TAG_LEN>()
+        .ok_or(OpenError::Length)?;
     let mut plaintext = Zeroizing::new([0u8; MAX_PLAINTEXT_LEN]);
     let data = &mut plaintext[..ciphertext.len()];
     data.copy_from_slice(ciphertext);
