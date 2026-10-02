@@ -282,8 +282,8 @@ impl<S: Storage> Store<S> {
     /// left behind (also when a power loss interrupted that), and finds the next creation
     /// sequence.
     pub fn open(mut storage: S) -> Self {
-        let config = *storage.config();
-        if config[CONFIG_VERSION] != LAYOUT_VERSION {
+        // Read in place: the record holds the PIN verifier.
+        if storage.config()[CONFIG_VERSION] != LAYOUT_VERSION {
             // Slots first: until the configuration is written, an interrupted format restarts.
             for slot in 0..storage.index_slots() {
                 if !is_zero(storage.index_entry(slot)) {
@@ -304,7 +304,7 @@ impl<S: Storage> Store<S> {
             return store;
         }
         let mut store = Self {
-            generation: read_u32(&config, CONFIG_GENERATION),
+            generation: read_u32(storage.config(), CONFIG_GENERATION),
             storage,
             next_sequence: 0,
         };
@@ -320,10 +320,12 @@ impl<S: Storage> Store<S> {
     /// The configuration.
     pub fn config(&self) -> Config {
         let record = self.storage.config();
+        // Copied straight into the zeroizing verifier: no plain array holds it on the way.
         let pin = (record[CONFIG_PIN_SET] == USED).then(|| {
-            let mut verifier = [0u8; PIN_VERIFIER_LEN];
-            verifier.copy_from_slice(&record[CONFIG_PIN..CONFIG_PIN + PIN_VERIFIER_LEN]);
-            PinVerifier::new(verifier)
+            let mut pin = PinVerifier::new([0; PIN_VERIFIER_LEN]);
+            pin.0
+                .copy_from_slice(&record[CONFIG_PIN..CONFIG_PIN + PIN_VERIFIER_LEN]);
+            pin
         });
         Config {
             epoch: read_u32(record, CONFIG_EPOCH),
