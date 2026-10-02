@@ -1,0 +1,331 @@
+//! CTAP2 commands (CTAP 2.2 §6): dispatch by command code, status codes (§8.2) and
+//! authenticatorGetInfo (§6.4).
+//!
+//! A request is the command byte followed by its CBOR parameters; a response is a status byte
+//! followed, on success, by the CBOR response.
+//!
+//! # Examples
+//!
+//! ```
+//! use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings, StatusCode};
+//!
+//! let max_msg_size = MaxMsgSize::try_from(1024).expect("at least 1024");
+//! let mut authenticator = Authenticator::new(Settings { max_msg_size });
+//! let mut response = [0u8; 128];
+//! let length = authenticator.process(&[0x04], &mut response);
+//! assert_eq!(response[0], StatusCode::Ok as u8);
+//! assert!(length > 1);
+//! ```
+
+use crate::cbor::{self, Encoder, Full};
+
+/// The AAGUID of this application, the same on every device (WebAuthn L3 §6.5.1).
+pub const AAGUID: [u8; 16] = [
+    0x8F, 0x92, 0x0F, 0x83, 0x9D, 0xA2, 0x48, 0x61, 0x94, 0xD7, 0x7F, 0x3C, 0x99, 0x45, 0xD5, 0x32,
+];
+
+/// CTAP2 command codes (§6, §8.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CommandCode {
+    /// authenticatorMakeCredential (§6.1).
+    MakeCredential = 0x01,
+    /// authenticatorGetAssertion (§6.2).
+    GetAssertion = 0x02,
+    /// authenticatorGetInfo (§6.4).
+    GetInfo = 0x04,
+    /// authenticatorClientPIN (§6.5).
+    ClientPin = 0x06,
+    /// authenticatorReset (§6.6).
+    Reset = 0x07,
+    /// authenticatorGetNextAssertion (§6.3).
+    GetNextAssertion = 0x08,
+    /// authenticatorBioEnrollment (§6.7).
+    BioEnrollment = 0x09,
+    /// authenticatorCredentialManagement (§6.8).
+    CredentialManagement = 0x0A,
+    /// authenticatorSelection (§6.9).
+    Selection = 0x0B,
+    /// authenticatorLargeBlobs (§6.10).
+    LargeBlobs = 0x0C,
+    /// authenticatorConfig (§6.11).
+    Config = 0x0D,
+}
+
+/// A command code that §6 does not define.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownCommand(pub u8);
+
+impl TryFrom<u8> for CommandCode {
+    type Error = UnknownCommand;
+
+    fn try_from(code: u8) -> Result<Self, UnknownCommand> {
+        Ok(match code {
+            0x01 => CommandCode::MakeCredential,
+            0x02 => CommandCode::GetAssertion,
+            0x04 => CommandCode::GetInfo,
+            0x06 => CommandCode::ClientPin,
+            0x07 => CommandCode::Reset,
+            0x08 => CommandCode::GetNextAssertion,
+            0x09 => CommandCode::BioEnrollment,
+            0x0A => CommandCode::CredentialManagement,
+            0x0B => CommandCode::Selection,
+            0x0C => CommandCode::LargeBlobs,
+            0x0D => CommandCode::Config,
+            other => return Err(UnknownCommand(other)),
+        })
+    }
+}
+
+/// CTAP status codes (§8.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StatusCode {
+    /// Successful response.
+    Ok = 0x00,
+    /// The command is not a valid CTAP command.
+    InvalidCommand = 0x01,
+    /// The command included an invalid parameter.
+    InvalidParameter = 0x02,
+    /// Invalid message or item length.
+    InvalidLength = 0x03,
+    /// Invalid message sequencing.
+    InvalidSeq = 0x04,
+    /// Message timed out.
+    Timeout = 0x05,
+    /// Channel busy.
+    ChannelBusy = 0x06,
+    /// Command requires channel lock.
+    LockRequired = 0x0A,
+    /// Command not allowed on this channel.
+    InvalidChannel = 0x0B,
+    /// Invalid or unexpected CBOR type.
+    CborUnexpectedType = 0x11,
+    /// Error when parsing CBOR.
+    InvalidCbor = 0x12,
+    /// Missing non-optional parameter.
+    MissingParameter = 0x14,
+    /// Limit for number of items exceeded.
+    LimitExceeded = 0x15,
+    // No 0x16: CTAP2_ERR_UNSUPPORTED_EXTENSION exists only in CTAP 2.0 and is absent from the
+    // §8.2 table; an extension the authenticator does not know is ignored (§8, unknown map
+    // keys), never rejected.
+    /// Fingerprint database is full.
+    FpDatabaseFull = 0x17,
+    /// Large blob storage is full.
+    LargeBlobStorageFull = 0x18,
+    /// Valid credential found in the exclude list.
+    CredentialExcluded = 0x19,
+    /// Lengthy operation in progress.
+    Processing = 0x21,
+    /// Credential not valid for the authenticator.
+    InvalidCredential = 0x22,
+    /// Waiting for user interaction.
+    UserActionPending = 0x23,
+    /// Lengthy operation in progress.
+    OperationPending = 0x24,
+    /// No request is pending.
+    NoOperations = 0x25,
+    /// Requested algorithm not supported.
+    UnsupportedAlgorithm = 0x26,
+    /// Not authorized for the requested operation.
+    OperationDenied = 0x27,
+    /// Internal key storage is full.
+    KeyStoreFull = 0x28,
+    /// Unsupported option.
+    UnsupportedOption = 0x2B,
+    /// Option not valid for the current operation.
+    InvalidOption = 0x2C,
+    /// Pending keepalive was cancelled.
+    KeepaliveCancel = 0x2D,
+    /// No valid credentials provided.
+    NoCredentials = 0x2E,
+    /// A user action timed out.
+    UserActionTimeout = 0x2F,
+    /// Continuation command not allowed.
+    NotAllowed = 0x30,
+    /// PIN invalid.
+    PinInvalid = 0x31,
+    /// PIN blocked.
+    PinBlocked = 0x32,
+    /// pinUvAuthParam verification failed.
+    PinAuthInvalid = 0x33,
+    /// PIN authentication blocked until power cycle.
+    PinAuthBlocked = 0x34,
+    /// No PIN has been set.
+    PinNotSet = 0x35,
+    /// A pinUvAuthToken is required.
+    PuatRequired = 0x36,
+    /// PIN policy violation.
+    PinPolicyViolation = 0x37,
+    // 0x38 is "Reserved for Future Use" in §8.2; an expired pinUvAuthToken is
+    // CTAP2_ERR_PIN_AUTH_INVALID (§6.5), not a code of its own.
+    /// The request is too large for the authenticator.
+    RequestTooLarge = 0x39,
+    /// The current operation timed out.
+    ActionTimeout = 0x3A,
+    /// User presence is required.
+    UpRequired = 0x3B,
+    /// Built-in user verification is disabled.
+    UvBlocked = 0x3C,
+    /// A checksum did not match.
+    IntegrityFailure = 0x3D,
+    /// The subcommand is invalid or not implemented.
+    InvalidSubcommand = 0x3E,
+    /// Built-in user verification unsuccessful.
+    UvInvalid = 0x3F,
+    /// The permissions parameter contains an unauthorized permission.
+    UnauthorizedPermission = 0x40,
+    /// Other unspecified error.
+    Other = 0x7F,
+}
+
+impl From<cbor::Error> for StatusCode {
+    /// §8: a message not in the canonical form is CTAP2_ERR_INVALID_CBOR; a member of the wrong
+    /// type is CTAP2_ERR_CBOR_UNEXPECTED_TYPE. Nesting beyond four levels is one of the §8
+    /// encoding requirements, so it is INVALID_CBOR too; LIMIT_EXCEEDED (§8.2) is for item
+    /// counts.
+    fn from(error: cbor::Error) -> Self {
+        match error {
+            cbor::Error::Malformed | cbor::Error::NotCanonical | cbor::Error::TooDeep => {
+                StatusCode::InvalidCbor
+            }
+            cbor::Error::UnexpectedType => StatusCode::CborUnexpectedType,
+        }
+    }
+}
+
+/// Smallest message an authenticator must accept (§8: "authenticators MUST support messages of
+/// at least 1024 bytes").
+pub const MIN_MESSAGE_SIZE: u16 = 1024;
+
+/// Largest request the transport accepts, reported as `maxMsgSize` (§6.4); never below
+/// [`MIN_MESSAGE_SIZE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaxMsgSize(u16);
+
+/// A message size below [`MIN_MESSAGE_SIZE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooSmall(pub u16);
+
+impl TryFrom<u16> for MaxMsgSize {
+    type Error = TooSmall;
+
+    fn try_from(size: u16) -> Result<Self, TooSmall> {
+        if size >= MIN_MESSAGE_SIZE {
+            Ok(Self(size))
+        } else {
+            Err(TooSmall(size))
+        }
+    }
+}
+
+impl MaxMsgSize {
+    /// The size in bytes.
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// Device facts the authenticator reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settings {
+    /// Largest request the transport accepts.
+    pub max_msg_size: MaxMsgSize,
+}
+
+/// The CTAP2 command processor.
+#[derive(Debug)]
+pub struct Authenticator {
+    settings: Settings,
+}
+
+impl Authenticator {
+    /// Creates the authenticator for a device described by `settings`.
+    pub const fn new(settings: Settings) -> Self {
+        Self { settings }
+    }
+
+    /// Processes one request (command byte and CBOR parameters) and writes the response
+    /// (status byte, then the CBOR response on success) into `response`, returning its length.
+    /// A response that does not fit is replaced by CTAP1_ERR_OTHER; an empty `response` gets
+    /// nothing.
+    pub fn process(&mut self, request: &[u8], response: &mut [u8]) -> usize {
+        let Some((status, body)) = response.split_first_mut() else {
+            return 0;
+        };
+        let mut encoder = Encoder::new(body);
+        let outcome = match request.split_first() {
+            // A CTAPHID_CBOR message carries at least the command byte (§11.2.9.1.2).
+            None => Err(StatusCode::InvalidLength),
+            Some((&code, parameters)) => self.command(code, parameters, &mut encoder),
+        };
+        let written = encoder.len();
+        match outcome {
+            Ok(()) => {
+                *status = StatusCode::Ok as u8;
+                written
+                    .checked_add(1)
+                    .expect("the body lies inside `response` after the status byte")
+            }
+            Err(code) => {
+                *status = code as u8;
+                1
+            }
+        }
+    }
+
+    fn command(
+        &mut self,
+        code: u8,
+        parameters: &[u8],
+        encoder: &mut Encoder<'_>,
+    ) -> Result<(), StatusCode> {
+        match CommandCode::try_from(code) {
+            Ok(CommandCode::GetInfo) => {
+                // §6.4 defines no parameters.
+                if !parameters.is_empty() {
+                    return Err(StatusCode::InvalidLength);
+                }
+                self.get_info(encoder).map_err(|Full| StatusCode::Other)
+            }
+            // §8.1: a command code the authenticator does not implement is
+            // CTAP1_ERR_INVALID_COMMAND.
+            Ok(
+                CommandCode::MakeCredential
+                | CommandCode::GetAssertion
+                | CommandCode::ClientPin
+                | CommandCode::Reset
+                | CommandCode::GetNextAssertion
+                | CommandCode::BioEnrollment
+                | CommandCode::CredentialManagement
+                | CommandCode::Selection
+                | CommandCode::LargeBlobs
+                | CommandCode::Config,
+            )
+            | Err(UnknownCommand(_)) => Err(StatusCode::InvalidCommand),
+        }
+    }
+
+    /// authenticatorGetInfo (§6.4) with the members implemented so far. `versions` stays empty
+    /// until a version's command set exists and passes its conformance tests: §6.4 requires the
+    /// member but not a non-empty list, and a version string is a promise platforms act on, so
+    /// an empty list is the truthful answer rather than an error for the command.
+    fn get_info(&self, encoder: &mut Encoder<'_>) -> Result<(), Full> {
+        encoder
+            .map(3)?
+            // versions (0x01), required.
+            .unsigned(0x01)?
+            .array(0)?
+            // aaguid (0x03), required.
+            .unsigned(0x03)?
+            .bytes(&AAGUID)?
+            // maxMsgSize (0x05).
+            .unsigned(0x05)?
+            .unsigned(u64::from(self.settings.max_msg_size.get()))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;

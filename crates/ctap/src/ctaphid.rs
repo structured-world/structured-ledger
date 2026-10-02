@@ -438,11 +438,12 @@ impl<const N: usize> Transport<N> {
             return self.broken(cid);
         };
         let take = remaining.min(CONT_DATA);
-        let Some(end) = filled.checked_add(take) else {
+        let (Some(end), Some(source_end)) = (filled.checked_add(take), 5usize.checked_add(take))
+        else {
             return self.broken(cid);
         };
         let (Some(target), Some(source)) =
-            (self.buffer.get_mut(filled..end), report.get(5..5 + take))
+            (self.buffer.get_mut(filled..end), report.get(5..source_end))
         else {
             return self.broken(cid);
         };
@@ -557,7 +558,10 @@ impl<const N: usize> Transport<N> {
         }
         // At most INIT_DATA bytes, which N is at least.
         let take = len.min(INIT_DATA);
-        self.buffer[..take].copy_from_slice(&report[7..7 + take]);
+        let source_end = 7usize
+            .checked_add(take)
+            .expect("take is at most INIT_DATA, so it ends within the report");
+        self.buffer[..take].copy_from_slice(&report[7..source_end]);
         self.mark_dirty(take);
         if take < len {
             self.state = State::Assembling {
@@ -679,11 +683,14 @@ impl Iterator for Frames<'_> {
         match self.seq {
             None => {
                 report[4] = self.command as u8 | INIT_BIT;
-                // `new` bounds the payload by MAX_MESSAGE_SIZE, which fits in BCNT.
-                let len = self.payload.len() as u16;
+                let len = u16::try_from(self.payload.len())
+                    .expect("new bounds the payload by MAX_MESSAGE_SIZE, which fits in BCNT");
                 report[5..7].copy_from_slice(&len.to_be_bytes());
                 let take = self.payload.len().min(INIT_DATA);
-                report[7..7 + take].copy_from_slice(&self.payload[..take]);
+                let report_end = 7usize
+                    .checked_add(take)
+                    .expect("take is at most INIT_DATA, so it ends within the report");
+                report[7..report_end].copy_from_slice(&self.payload[..take]);
                 self.offset = take;
                 self.seq = Some(0);
             }
@@ -703,7 +710,10 @@ impl Iterator for Frames<'_> {
                     .offset
                     .checked_add(take)
                     .expect("offset + take stays within the payload length");
-                report[5..5 + take].copy_from_slice(&self.payload[self.offset..end]);
+                let report_end = 5usize
+                    .checked_add(take)
+                    .expect("take is at most CONT_DATA, so it ends within the report");
+                report[5..report_end].copy_from_slice(&self.payload[self.offset..end]);
                 self.offset = end;
                 // A payload of at most MAX_MESSAGE_SIZE ends by sequence MAX_SEQ (0x7F), so the
                 // next value is at most 0x80 and is never written: the payload is exhausted.
