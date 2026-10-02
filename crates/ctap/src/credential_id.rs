@@ -365,7 +365,17 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
             }
             1 => {
                 expect_key(entries, 3)?;
-                KeySource::Seed(fixed_bytes(entries)?)
+                let source = entries.value().bytes()?;
+                if source.len() != SEED_LEN {
+                    return Err(NOT_A_CREDENTIAL);
+                }
+                // Copied straight into the zeroizing key source: no plain array holds the seed
+                // on its way there. The source is the zeroizing plaintext buffer.
+                let mut key = KeySource::Seed([0; SEED_LEN]);
+                if let KeySource::Seed(seed) = &mut key {
+                    seed.copy_from_slice(source);
+                }
+                key
             }
             _ => return Err(NOT_A_CREDENTIAL),
         };
