@@ -119,15 +119,26 @@ fn reference_item(data: &[u8], position: &mut usize, depth: u8) -> bool {
         2 => reference_take(data, position, value).is_some(),
         3 => reference_take(data, position, value)
             .is_some_and(|text| std::str::from_utf8(text).is_ok()),
-        4 => depth < 4 && (0..value).all(|_| reference_item(data, position, depth + 1)),
+        4 => {
+            if depth >= 4 {
+                return false;
+            }
+            let inner = depth
+                .checked_add(1)
+                .expect("depth is below 4, checked above");
+            (0..value).all(|_| reference_item(data, position, inner))
+        }
         _ => {
             if depth >= 4 {
                 return false;
             }
+            let inner = depth
+                .checked_add(1)
+                .expect("depth is below 4, checked above");
             let mut previous: Option<&[u8]> = None;
             for _ in 0..value {
                 let start = *position;
-                if !reference_item(data, position, depth + 1) {
+                if !reference_item(data, position, inner) {
                     return false;
                 }
                 let key = &data[start..*position];
@@ -138,7 +149,7 @@ fn reference_item(data: &[u8], position: &mut usize, depth: u8) -> bool {
                     }
                 }
                 previous = Some(key);
-                if !reference_item(data, position, depth + 1) {
+                if !reference_item(data, position, inner) {
                     return false;
                 }
             }
