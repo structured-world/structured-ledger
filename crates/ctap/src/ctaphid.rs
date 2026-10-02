@@ -850,6 +850,11 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         if command == Command::Init && len != NONCE_LEN {
             return self.error(cid, ErrorCode::InvalidLen);
         }
+        // A CBOR request starts with the CTAP command byte (§11.2.9.1.2) and a MSG request is a
+        // U2F message (§11.2.9.1.1): without data there is no request to hand out.
+        if matches!(command, Command::Cbor | Command::Msg) && len == 0 {
+            return self.error(cid, ErrorCode::InvalidLen);
+        }
         if len > N {
             return self.error(cid, ErrorCode::InvalidLen);
         }

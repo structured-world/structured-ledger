@@ -1076,3 +1076,19 @@ fn cancel_with_a_payload_is_ignored() {
         (1, 0x01, vec![3; 60])
     );
 }
+
+/// A CBOR request carries the CTAP command byte (§11.2.9.1.2) and a MSG request a U2F message
+/// (§11.2.9.1.1), so BCNT 0 is no request: ERR_INVALID_LEN, nothing handed to the CTAP layer,
+/// and the device stays idle for the next request.
+#[test]
+fn empty_cbor_and_msg_requests_are_invalid_length() {
+    let mut transport = with_channels::<1024>(1);
+    for command in [0x10, 0x03] {
+        assert_eq!(
+            answer(&mut transport, &init_packet(1, command, 0, &[]), 0),
+            error(1, 0x03)
+        );
+        assert_eq!(transport.active(), None);
+    }
+    cbor_request(&mut transport, 1, 0);
+}
