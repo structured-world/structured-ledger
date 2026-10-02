@@ -13,7 +13,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
-structured-passkeys-ctap = { path = ".." }
+structured-passkeys-ctap = { path = "..", features = ["soft"] }
 
 [[bin]]
 name = "ctaphid"
@@ -25,6 +25,13 @@ bench = false
 [[bin]]
 name = "cbor"
 path = "fuzz_targets/cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "credential-id"
+path = "fuzz_targets/credential_id.rs"
 test = false
 doc = false
 bench = false
