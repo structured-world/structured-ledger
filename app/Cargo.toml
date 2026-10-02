@@ -12,7 +12,7 @@ publish = false
 # `app_io_stack` runs the IO stack in the application, so the application can drive the FIDO HID
 # interface itself, and `Comm::next_command_or_event` hands it the ticker events its transport
 # clock needs; both come from this fork of the Ledger Rust SDK until the published crate has them.
-ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "b3d97e01ffacf667ed4ff6744437b8102eb10059", features = ["io_new", "nano_nbgl", "app_io_stack"] }
+ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "77f7711b998d55967478ce846006e03029db2ce0", features = ["io_new", "nano_nbgl", "app_io_stack"] }
 structured-passkeys-ctap = { path = "../crates/ctap", default-features = false }
 
 # Read by the SDK build script into the install parameters of the binary. Icon paths are
