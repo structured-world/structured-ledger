@@ -304,14 +304,19 @@ impl<'a> Decoder<'a> {
         if self.depth >= MAX_NESTING {
             return Err(Error::TooDeep);
         }
-        self.depth += 1;
+        self.depth = self
+            .depth
+            .checked_add(1)
+            .expect("depth stays below MAX_NESTING, checked above");
         Ok(())
     }
 
     /// Every `close` follows a successful `open`, so the depth is at least one here.
     fn close(&mut self) {
-        debug_assert!(self.depth > 0, "close matches open");
-        self.depth -= 1;
+        self.depth = self
+            .depth
+            .checked_sub(1)
+            .expect("close matches a successful open");
     }
 
     /// Reads an array: `read` gets its elements and may stop early, the rest is skipped and
