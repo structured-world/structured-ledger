@@ -16,6 +16,12 @@ ledger_device_sdk::define_comm!(COMM);
 /// Name on the home screen; the same as `package.metadata.ledger.name`.
 const APP_NAME: &str = "Structured Passkeys";
 
+/// What the home screen of the touch devices says under the name; without it the SDK shows its
+/// default line about signing transactions on a network. The Nano home screen shows the name
+/// alone, and a tagline would take its place there.
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+const TAGLINE: &str = "Passkeys and FIDO2 security key for signing in to websites and apps";
+
 /// Class byte of the Ledger management channel; the SDK rejects other classes.
 const CLA: u8 = 0xE0;
 
@@ -34,7 +40,10 @@ extern "C" fn sample_main(_arg0: u32) {
     comm.set_expected_cla(CLA);
 
     // The home screen carries the version page and the quit action.
-    let mut home = NbglHomeAndSettings::new().glyph(&HOME_GLYPH).infos(
+    let home = NbglHomeAndSettings::new().glyph(&HOME_GLYPH);
+    #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+    let home = home.tagline(TAGLINE);
+    let mut home = home.infos(
         APP_NAME,
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_PKG_AUTHORS"),
