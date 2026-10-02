@@ -15,6 +15,7 @@ use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings};
 use structured_passkeys_ctap::ctaphid::{
     DeviceInfo, Event, MAX_MESSAGE_SIZE, REPORT_SIZE, Report, Transport,
 };
+use zeroize::Zeroize;
 
 /// Interval of the OS ticker events the main loop forwards to [`tick`]; the transport clock
 /// advances by this much per tick.
@@ -484,18 +485,26 @@ unsafe extern "C" fn data_out(
 ) -> UsbdStatus {
     // Every report on this interface is 64 bytes (§11.2.4, the report descriptor above); a
     // shorter or empty transfer is not a report and is dropped rather than padded into one.
-    let report: Option<Report> = if packet.is_null() || usize::from(length) != REPORT_SIZE {
+    // Read in place, never copied: a request can carry PIN/UV material.
+    let mut report: Option<&mut Report> = if packet.is_null() || usize::from(length) != REPORT_SIZE
+    {
         None
     } else {
-        // SAFETY: the stack passes its transfer buffer holding `length` received bytes.
-        let received = unsafe { core::slice::from_raw_parts(packet, REPORT_SIZE) };
+        // SAFETY: the stack passes its transfer buffer holding `length` received bytes, and does
+        // not touch it until the endpoint is armed again below.
+        let received = unsafe { core::slice::from_raw_parts_mut(packet, REPORT_SIZE) };
         received.try_into().ok()
     };
     let handled = with_hid(|hid| {
         hid.pdev = pdev;
-        if let Some(report) = &report {
+        if let Some(report) = report.as_deref() {
             let event = hid.transport.receive(report, hid.now_ms);
             hid.handle(event);
+        }
+        // The transport keeps what it needs; the stack's copy is wiped before the endpoint can
+        // receive into it again.
+        if let Some(report) = report.as_deref_mut() {
+            report.zeroize();
         }
         // A full error queue holds the host back, and a refused arming is retried: either way
         // the endpoint stays marked until `pump` arms it.
@@ -503,6 +512,10 @@ unsafe extern "C" fn data_out(
     });
     if handled.is_some() {
         return USBD_OK;
+    }
+    // Before `start` the report is dropped unread, and wiped all the same.
+    if let Some(report) = report {
+        report.zeroize();
     }
     // SAFETY: before `start` nothing holds the endpoint back; `pdev` is the stack's handle.
     unsafe { USBD_LL_PrepareReceive(pdev, EP_OUT, core::ptr::null_mut(), REPORT_SIZE as u32) }

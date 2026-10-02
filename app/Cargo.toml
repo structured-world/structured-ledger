@@ -14,6 +14,7 @@ publish = false
 # clock needs; both come from this fork of the Ledger Rust SDK until the published crate has them.
 ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "77f7711b998d55967478ce846006e03029db2ce0", features = ["io_new", "nano_nbgl", "app_io_stack"] }
 structured-passkeys-ctap = { path = "../crates/ctap", default-features = false }
+zeroize = { version = "1.9.0", default-features = false }
 
 # Read by the SDK build script into the install parameters of the binary. Icon paths are
 # relative to this directory.
