@@ -584,6 +584,21 @@ fn queued_errors_keep_their_order_and_overflow_is_dropped() {
     );
 }
 
+/// A full error queue asks the device to stop taking reports, so a host that sends faster than it
+/// reads is held back instead of losing the errors it is owed; reading frees the queue again.
+#[test]
+fn a_full_error_queue_holds_reports_back() {
+    let mut transport = with_channels::<1024>(1);
+    for cid in 10..13 {
+        transport.receive(&init_packet(cid, 0x01, 0, &[]), 0);
+        assert!(transport.can_receive(), "{} errors queued", cid - 9);
+    }
+    transport.receive(&init_packet(13, 0x01, 0, &[]), 0);
+    assert!(!transport.can_receive(), "the fourth error fills the queue");
+    transport.next_report(0).expect("the oldest error");
+    assert!(transport.can_receive());
+}
+
 /// CANCEL on the active channel reaches the CTAP layer and is never answered; CANCEL anywhere
 /// else, including an invalid channel, is ignored (§11.2.9.1.5).
 #[test]

@@ -79,9 +79,9 @@ const INIT_BIT: u8 = 0x80;
 const NONCE_LEN: usize = 8;
 const INIT_RESPONSE_LEN: usize = 17;
 
-/// Transport errors waiting for the endpoint. Errors only arise from host packets, at most one
-/// per packet, and the queue drains one report per endpoint completion; a host that floods the
-/// device faster than it reads loses the overflow, which it would time out on anyway.
+/// Transport errors waiting for the endpoint. Errors arise from host packets, at most one per
+/// packet, and the queue drains one report per endpoint completion; when it is full the device
+/// stops taking reports ([`Transport::can_receive`]) until the host reads.
 const ERROR_QUEUE: usize = 4;
 
 /// CTAPHID command codes (§11.2.9).
@@ -301,7 +301,12 @@ impl ErrorQueue {
         }
     }
 
-    /// Queues an error; a full queue drops it (see [`ERROR_QUEUE`]).
+    const fn is_full(&self) -> bool {
+        self.len >= ERROR_QUEUE
+    }
+
+    /// Queues an error. A full queue drops it; devices hold reports back while the queue is full
+    /// ([`Transport::can_receive`]), so only a device that ignores that loses one.
     fn push(&mut self, cid: u32, code: ErrorCode) {
         if let Some(slot) = self.entries.get_mut(self.len) {
             *slot = (cid, code);
@@ -396,6 +401,13 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
     /// Largest request accepted, in bytes.
     pub const fn max_message_size(&self) -> usize {
         N
+    }
+
+    /// Whether the next report can be taken without losing an answer it may need: false while
+    /// the queue of errors waiting for the endpoint is full. A device stops arming its OUT
+    /// endpoint until it is true again, which holds back a host that sends faster than it reads.
+    pub const fn can_receive(&self) -> bool {
+        !self.errors.is_full()
     }
 
     /// Forgets every channel, transaction and queued report, as when the device is reset on the

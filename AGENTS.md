@@ -53,7 +53,10 @@ Rules a change in this repository must meet. Reviewers check them; the gate scri
 - Scripts run on a clean machine: no git identity, no global configuration, nothing outside the
   repository assumed. Cargo commands in the gate use `--locked`.
 - Tools whose verdicts change between versions (shellcheck, linters) are pinned in CI to the version
-  the gate uses locally; GitHub Actions are pinned by commit SHA.
+  the gate uses locally; GitHub Actions are pinned by commit SHA. The exception is Ledger's
+  dev-tools image (`scripts/dev-tools-image.sh`), which follows `latest` on purpose: Ledger builds
+  catalog releases with the latest image and its checks require the newest SDK, so a pinned image
+  would test a build Ledger never ships.
 
 ## Commits and pull requests
 
