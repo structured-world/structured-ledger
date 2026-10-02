@@ -21,3 +21,10 @@ path = "fuzz_targets/ctaphid.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cbor"
+path = "fuzz_targets/cbor.rs"
+test = false
+doc = false
+bench = false
