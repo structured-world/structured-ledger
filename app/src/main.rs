@@ -1,4 +1,5 @@
-//! Device application: shows the home screen and answers the Ledger APDU channel.
+//! Device application: opens its NVM state, shows the home screen and answers the Ledger APDU
+//! channel.
 
 #![no_std]
 #![no_main]
@@ -6,6 +7,9 @@
 use ledger_device_sdk::include_gif;
 use ledger_device_sdk::io::{self, CommError, StatusWords};
 use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
+use structured_passkeys_ctap::storage::Store;
+
+mod storage;
 
 ledger_device_sdk::set_panic!(ledger_device_sdk::exiting_panic);
 ledger_device_sdk::define_comm!(COMM);
@@ -28,6 +32,11 @@ const HOME_GLYPH: NbglGlyph =
 extern "C" fn sample_main(_arg0: u32) {
     let comm = io::init_comm(&COMM);
     comm.set_expected_cla(CLA);
+
+    // Opening the store formats a fresh install and finishes a reset or a replacement that a
+    // power loss interrupted.
+    // SAFETY: the only place that takes the NVM regions.
+    Store::open(unsafe { storage::NvmStorage::take() });
 
     // The home screen carries the version page and the quit action.
     let mut home = NbglHomeAndSettings::new().glyph(&HOME_GLYPH).infos(
