@@ -7,6 +7,7 @@ use core::fmt;
 
 use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
+use hmac::digest::FixedOutput;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::{DerSignature, SigningKey};
@@ -53,7 +54,8 @@ impl SoftCrypto {
 impl Crypto for SoftCrypto {
     fn random(&mut self, out: &mut [u8]) {
         for chunk in out.chunks_mut(KEY_LEN) {
-            let block = self.sha256(&[&self.seed, &self.counter.to_be_bytes()]);
+            // The block may become secret material (credential seeds, nonces).
+            let block = Zeroizing::new(self.sha256(&[&self.seed, &self.counter.to_be_bytes()]));
             chunk.copy_from_slice(&block[..chunk.len()]);
             self.counter = self
                 .counter
@@ -76,7 +78,10 @@ impl Crypto for SoftCrypto {
         for part in parts {
             mac.update(part);
         }
-        Zeroizing::new(mac.finalize().into_bytes().into())
+        // Finalized straight into the zeroizing buffer, without an intermediate copy of the tag.
+        let mut tag = Zeroizing::new([0u8; KEY_LEN]);
+        mac.finalize_into((&mut *tag).into());
+        tag
     }
 
     fn aes256_gcm_seal(
