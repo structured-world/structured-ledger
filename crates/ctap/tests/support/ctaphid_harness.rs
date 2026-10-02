@@ -115,6 +115,8 @@ fn take(transport: &mut Transport<BUFFER>, host: &mut Host, now: u64, one: bool)
         let Some(report) = transport.next_report(now) else {
             return count;
         };
+        // The host reads it, as the device reports on its IN completion.
+        transport.sent();
         host.read(&report, active);
         count += 1;
         // A message is at most 129 reports, plus queued errors and a keepalive.

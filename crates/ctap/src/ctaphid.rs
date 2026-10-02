@@ -281,7 +281,9 @@ enum State {
         cid: u32,
         command: Command,
         len: usize,
-        next: Cursor,
+        /// The next report to hand out; `None` once the last one is out and waits for the host
+        /// to read it ([`Transport::sent`]).
+        next: Option<Cursor>,
         last_progress_ms: u64,
     },
 }
@@ -457,13 +459,13 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
     }
 
     /// Starts sending the `len`-byte message in the buffer; the device stays busy until its last
-    /// report is handed out.
+    /// report has been read ([`Transport::sent`]).
     fn send(&mut self, cid: u32, command: Command, len: usize, now_ms: u64) {
         self.state = State::Sending {
             cid,
             command,
             len,
-            next: Cursor::Init,
+            next: Some(Cursor::Init),
             last_progress_ms: now_ms,
         };
     }
@@ -611,26 +613,34 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         else {
             return None;
         };
+        let Some(next) = next else {
+            // The last report waits for `sent`.
+            return None;
+        };
         if len > N {
             // `len <= N` whenever a message is sent; a violation drops it.
             self.reset();
             return None;
         }
         let (report, following) = frame(cid, command, &self.bytes()[..len], next);
-        match following {
-            Some(next) => {
-                self.state = State::Sending {
-                    cid,
-                    command,
-                    len,
-                    next,
-                    last_progress_ms: now_ms,
-                };
-            }
-            // The last report is out: the transaction ends and its data goes.
-            None => self.reset(),
-        }
+        // After the last report the device stays busy until the host has read it (`sent`).
+        self.state = State::Sending {
+            cid,
+            command,
+            len,
+            next: following,
+            last_progress_ms: now_ms,
+        };
         Some(report)
+    }
+
+    /// The host read the report last handed out by [`Transport::next_report`]; called by the
+    /// device on every IN completion. After the last report of a response, the transaction ends
+    /// and its data goes (§11.2.5.1: busy until the response is sent).
+    pub fn sent(&mut self) {
+        if let State::Sending { next: None, .. } = self.state {
+            self.reset();
+        }
     }
 
     /// Handles one report received at `now_ms` (a monotonic millisecond clock).

@@ -467,6 +467,7 @@ unsafe extern "C" fn data_in(pdev: *mut c_void, _cookie: *mut c_void, _ep: u8) -
     with_hid(|hid| {
         hid.pdev = pdev;
         hid.in_flight = false;
+        hid.transport.sent();
         hid.pump();
     });
     USBD_OK

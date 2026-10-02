@@ -42,10 +42,12 @@ fn cont_packet(cid: u32, seq: u8, data: &[u8]) -> Report {
     report
 }
 
-/// Every report the transport has to send at `now`, in order.
+/// Every report the transport has to send at `now`, in order, each read by the host as a device
+/// would report it (`sent` after every endpoint completion).
 fn drain<const N: usize>(transport: &mut Transport<N>, now: u64) -> Vec<Report> {
     let mut reports = Vec::new();
     while let Some(report) = transport.next_report(now) {
+        transport.sent();
         reports.push(report);
         assert!(reports.len() <= 200, "the transport never stops sending");
     }
@@ -419,6 +421,29 @@ fn the_device_is_busy_until_the_response_is_sent() {
         answer(&mut transport, &init_packet(2, 0x01, 0, &[]), 0),
         (2, 0x01, Vec::new()),
         "idle once the echo is out"
+    );
+}
+
+/// The busy period ends when the host has read the last report of a response, not when the
+/// device handed it to the endpoint (§11.2.5.1): until `sent` acknowledges that completion,
+/// another channel is still busy.
+#[test]
+fn the_device_is_busy_until_the_last_report_is_read() {
+    let mut transport = with_channels::<1024>(2);
+    transport.receive(&init_packet(1, 0x01, 1, &[0x42]), 0);
+    let echo = transport.next_report(0).expect("the one-report echo");
+    assert_eq!(messages(&[echo]), vec![(1, 0x01, vec![0x42])]);
+    assert_eq!(
+        transport.receive(&init_packet(2, 0x01, 0, &[]), 0),
+        Event::None
+    );
+    let busy = transport.next_report(0).expect("the busy error");
+    assert_eq!(messages(&[busy]), vec![error(2, 0x06)], "echo not read yet");
+    transport.sent();
+    assert_eq!(
+        answer(&mut transport, &init_packet(2, 0x01, 0, &[]), 0),
+        (2, 0x01, Vec::new()),
+        "idle once the echo was read"
     );
 }
 
