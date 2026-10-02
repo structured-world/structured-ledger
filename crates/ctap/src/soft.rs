@@ -86,7 +86,8 @@ impl Crypto for SoftCrypto {
         aad: &[u8],
         data: &mut [u8],
     ) -> [u8; TAG_LEN] {
-        let cipher = Aes256Gcm::new(&(*key).into());
+        // Borrowed, not copied: a temporary key array would stay on the stack unzeroized.
+        let cipher = Aes256Gcm::new(key.into());
         cipher
             .encrypt_inout_detached(&Nonce::from(*nonce), aad, data.into())
             .expect("AES-GCM takes messages far longer than a credential ID")
@@ -101,7 +102,7 @@ impl Crypto for SoftCrypto {
         data: &mut [u8],
         tag: &[u8; TAG_LEN],
     ) -> Result<(), CryptoError> {
-        let cipher = Aes256Gcm::new(&(*key).into());
+        let cipher = Aes256Gcm::new(key.into());
         cipher
             .decrypt_inout_detached(&Nonce::from(*nonce), aad, data.into(), &Tag::from(*tag))
             .map_err(|_| CryptoError::Authentication)
