@@ -32,7 +32,9 @@ pub struct NvmStorage {
 }
 
 impl NvmStorage {
-    /// The regions, through the PIC-translated addresses of the statics.
+    /// The regions, through the PIC-translated addresses of the statics. A record that was
+    /// never written (Speculos loads `.nvm_data` zeroed, validity flags included) is written
+    /// as zeros, the free record, so every later read finds a valid copy.
     ///
     /// # Safety
     ///
@@ -42,13 +44,21 @@ impl NvmStorage {
         let index = &raw mut INDEX;
         let keys = &raw mut KEYS;
         // SAFETY: the caller takes the statics once, so these are their only references.
-        unsafe {
+        let storage = unsafe {
             Self {
                 config: (*config).get_mut(),
                 index: (*index).get_mut(),
                 keys: (*keys).get_mut(),
             }
+        };
+        storage.config.get_or_init(&[0; CONFIG_LEN]);
+        for record in storage.index.iter_mut() {
+            record.get_or_init(&[0; INDEX_ENTRY_LEN]);
         }
+        for record in storage.keys.iter_mut() {
+            record.get_or_init(&[0; KEY_SLOT_LEN]);
+        }
+        storage
     }
 }
 
