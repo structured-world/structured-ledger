@@ -2,11 +2,12 @@
 # Runs the checks that need Ledger's Linux dev-tools image on the project's
 # Linux check host over SSH, without pushing anything.
 #
-#   STRUCTURED_PASSKEYS_LINUX=<ssh destination> scripts/linux/check.sh device
+#   STRUCTURED_PASSKEYS_LINUX=<ssh destination> scripts/linux/check.sh device|speculos
 #
 # `device` builds and lints the device application for every target
 # (scripts/device-build.sh) and copies the artifacts back into
-# target/device/<target>/ of this checkout.
+# target/device/<target>/ of this checkout. `speculos` does the same, then runs
+# every build in Speculos (scripts/speculos-check.sh).
 #
 # The working tree is snapshotted as it is, uncommitted and untracked files
 # included (ignored files excluded), through a temporary index: HEAD, the index
@@ -24,9 +25,9 @@ destination="${STRUCTURED_PASSKEYS_LINUX:?set STRUCTURED_PASSKEYS_LINUX to the S
 action="${1:?action: device}"
 
 case "$action" in
-    device) ;;
+    device | speculos) ;;
     *)
-        echo "unknown action $action: device" >&2
+        echo "unknown action $action: device, speculos" >&2
         exit 2
         ;;
 esac

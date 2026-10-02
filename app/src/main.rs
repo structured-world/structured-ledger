@@ -40,8 +40,8 @@ extern "C" fn sample_main(_arg0: u32) {
     loop {
         let command = comm.next_command();
         // No management command is implemented: ISO/IEC 7816-4 5.6, SW 6D00 "instruction code
-        // not supported or invalid".
-        match command.reply(&[], StatusWords::BadIns) {
+        // not supported or invalid". The SDK names 0x6D00 `Unknown`; its `BadIns` is 0x6E01.
+        match command.reply(&[], StatusWords::Unknown) {
             // An empty reply cannot overflow, and a reply that failed to leave the device has
             // no one to report to: the host times out and the loop takes its next command.
             Ok(()) | Err(CommError::Overflow | CommError::IoError) => {}
