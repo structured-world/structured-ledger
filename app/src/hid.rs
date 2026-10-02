@@ -395,12 +395,17 @@ pub fn tick() {
 
 /// Class `init`: the interface was configured; the transport starts over for the host.
 unsafe extern "C" fn init(pdev: *mut c_void, _cookie: *mut c_void) -> UsbdStatus {
-    with_hid(|hid| {
+    let handled = with_hid(|hid| {
         hid.reset();
         hid.pdev = pdev;
+        // A refused first arming is retried by `pump` like any other.
+        hid.arm_out();
     });
-    // SAFETY: `pdev` is the stack's handle; a null buffer lets the stack deliver the report in
-    // its own transfer buffer.
+    if handled.is_some() {
+        return USBD_OK;
+    }
+    // SAFETY: before `start` nothing holds the endpoint back; `pdev` is the stack's handle; a
+    // null buffer lets the stack deliver the report in its own transfer buffer.
     unsafe { USBD_LL_PrepareReceive(pdev, EP_OUT, core::ptr::null_mut(), REPORT_SIZE as u32) }
 }
 
@@ -483,29 +488,26 @@ unsafe extern "C" fn data_out(
     packet: *mut u8,
     length: u16,
 ) -> UsbdStatus {
-    // Every report on this interface is 64 bytes (§11.2.4, the report descriptor above); a
-    // shorter or empty transfer is not a report and is dropped rather than padded into one.
-    // Read in place, never copied: a request can carry PIN/UV material.
-    let mut report: Option<&mut Report> = if packet.is_null() || usize::from(length) != REPORT_SIZE
-    {
-        None
+    // The received bytes, read in place and never copied: a request can carry PIN/UV material,
+    // so they are wiped whatever the transfer turns out to be.
+    let received: &mut [u8] = if packet.is_null() {
+        &mut []
     } else {
         // SAFETY: the stack passes its transfer buffer holding `length` received bytes, and does
         // not touch it until the endpoint is armed again below.
-        let received = unsafe { core::slice::from_raw_parts_mut(packet, REPORT_SIZE) };
-        received.try_into().ok()
+        unsafe { core::slice::from_raw_parts_mut(packet, usize::from(length).min(REPORT_SIZE)) }
     };
     let handled = with_hid(|hid| {
         hid.pdev = pdev;
-        if let Some(report) = report.as_deref() {
+        // Every report on this interface is 64 bytes (§11.2.4, the report descriptor above); a
+        // shorter or empty transfer is not a report and is dropped rather than padded into one.
+        if let Ok(report) = <&Report>::try_from(&*received) {
             let event = hid.transport.receive(report, hid.now_ms);
             hid.handle(event);
         }
         // The transport keeps what it needs; the stack's copy is wiped before the endpoint can
         // receive into it again.
-        if let Some(report) = report.as_deref_mut() {
-            report.zeroize();
-        }
+        received.zeroize();
         // A full error queue holds the host back, and a refused arming is retried: either way
         // the endpoint stays marked until `pump` arms it.
         hid.arm_out();
@@ -513,10 +515,8 @@ unsafe extern "C" fn data_out(
     if handled.is_some() {
         return USBD_OK;
     }
-    // Before `start` the report is dropped unread, and wiped all the same.
-    if let Some(report) = report {
-        report.zeroize();
-    }
+    // Before `start` the transfer is dropped unread, and wiped all the same.
+    received.zeroize();
     // SAFETY: before `start` nothing holds the endpoint back; `pdev` is the stack's handle.
     unsafe { USBD_LL_PrepareReceive(pdev, EP_OUT, core::ptr::null_mut(), REPORT_SIZE as u32) }
 }
