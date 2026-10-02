@@ -11,16 +11,23 @@ use hmac::{Hmac, Mac};
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::{DerSignature, SigningKey};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{Crypto, CryptoError, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, Signature, TAG_LEN};
 
 /// Software cryptography with a fixed application node and a seeded generator. Its `Debug`
-/// output never prints the node or the seed.
+/// output never prints the node or the seed, and both are zeroized on drop.
 pub struct SoftCrypto {
     node: [u8; KEY_LEN],
     seed: [u8; KEY_LEN],
     counter: u64,
+}
+
+impl Drop for SoftCrypto {
+    fn drop(&mut self) {
+        self.node.zeroize();
+        self.seed.zeroize();
+    }
 }
 
 impl fmt::Debug for SoftCrypto {

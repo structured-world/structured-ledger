@@ -20,7 +20,10 @@ use crate::keys::KeyRing;
 pub const VERSION: u8 = 0x01;
 /// Longest user ID: WebAuthn L3 §5.1.3 step 5 refuses a `user.id` outside 1..=64 bytes.
 pub const MAX_USER_ID_LEN: usize = 64;
-/// Longest stored user name and display name, in bytes.
+/// Longest stored user name and display name, in bytes. WebAuthn L3 §5.4.1 and §5.4.3 let a
+/// stored `name` / `displayName` be truncated (§6.4.1.2: on a code point boundary) to any limit
+/// of at least 64 bytes; the names travel inside every credential ID the RP stores and sends
+/// back, so the smallest permitted limit keeps IDs short.
 pub const MAX_NAME_LEN: usize = 64;
 /// Credential random seed length.
 pub const SEED_LEN: usize = 32;
