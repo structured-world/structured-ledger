@@ -3,7 +3,7 @@
 # before review is listed here and nowhere else; a new crate, device target or test
 # suite is added to this script in the change that introduces it.
 #
-# Device builds need Ledger's Linux dev-tools image: on Linux they run here, on
+# Device builds and their Speculos runs need Ledger's Linux dev-tools image: on Linux they run here, on
 # macOS on the Linux check host named by STRUCTURED_PASSKEYS_LINUX
 # (scripts/linux/check.sh). Without that host the gate fails instead of
 # skipping them.
@@ -49,13 +49,17 @@ fuzz=(--manifest-path crates/ctap/fuzz/Cargo.toml)
 run cargo fmt "${fuzz[@]}" --check
 run cargo clippy --locked "${fuzz[@]}" --all-targets -- -D warnings
 
+# Every device build then runs in Speculos (scripts/speculos-check.sh).
 case "$(uname -s)" in
-    Linux) run scripts/device-build.sh ;;
+    Linux)
+        run scripts/device-build.sh
+        run scripts/speculos-check.sh
+        ;;
     *)
         if [[ -z "${STRUCTURED_PASSKEYS_LINUX:-}" ]]; then
             echo "device builds need the Linux check host: set STRUCTURED_PASSKEYS_LINUX" >&2
             exit 1
         fi
-        run scripts/linux/check.sh device
+        run scripts/linux/check.sh speculos
         ;;
 esac
