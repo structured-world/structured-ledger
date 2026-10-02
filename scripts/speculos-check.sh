@@ -100,7 +100,7 @@ docker run --rm \
             stop
             echo "== speculos $target, FIDO HID"
             if start "$model" U2F "$elf"; then
-                if ! /tmp/fido/bin/python scripts/fido_check.py --speculos 9999; then
+                if ! /tmp/fido/bin/python scripts/fido_check.py --speculos; then
                     cat /tmp/speculos.log
                     status=1
                 fi
