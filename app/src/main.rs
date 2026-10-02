@@ -1,10 +1,13 @@
-//! Device application: shows the home screen and answers the Ledger APDU channel.
+//! Device application: shows the home screen, runs the FIDO HID interface and answers the Ledger
+//! APDU channel.
 
 #![no_std]
 #![no_main]
 
+mod hid;
+
 use ledger_device_sdk::include_gif;
-use ledger_device_sdk::io::{self, CommError, StatusWords};
+use ledger_device_sdk::io::{self, CommError, CommandOrEvent, DecodedEventType, StatusWords};
 use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
 
 ledger_device_sdk::set_panic!(ledger_device_sdk::exiting_panic);
@@ -26,6 +29,7 @@ const HOME_GLYPH: NbglGlyph =
 
 #[unsafe(no_mangle)]
 extern "C" fn sample_main(_arg0: u32) {
+    hid::start();
     let comm = io::init_comm(&COMM);
     comm.set_expected_cla(CLA);
 
@@ -37,14 +41,23 @@ extern "C" fn sample_main(_arg0: u32) {
     );
     home.show_and_return();
 
+    // FIDO HID reports reach the transport through the USB class callbacks during each event;
+    // the loop only gives the transport its clock and answers the management channel.
     loop {
-        let command = comm.next_command();
-        // No management command is implemented: ISO/IEC 7816-4 5.6, SW 6D00 "instruction code
-        // not supported or invalid". The SDK names 0x6D00 `Unknown`; its `BadIns` is 0x6E01.
-        match command.reply(&[], StatusWords::Unknown) {
-            // An empty reply cannot overflow, and a reply that failed to leave the device has
-            // no one to report to: the host times out and the loop takes its next command.
-            Ok(()) | Err(CommError::Overflow | CommError::IoError) => {}
+        match comm.next_command_or_event() {
+            CommandOrEvent::Command(command) => {
+                // No management command is implemented: ISO/IEC 7816-4 5.6, SW 6D00
+                // "instruction code not supported or invalid". The SDK names 0x6D00 `Unknown`;
+                // its `BadIns` is 0x6E01.
+                match command.reply(&[], StatusWords::Unknown) {
+                    // An empty reply cannot overflow, and a reply that failed to leave the
+                    // device has no one to report to: the host times out and the loop takes
+                    // its next command.
+                    Ok(()) | Err(CommError::Overflow | CommError::IoError) => {}
+                }
+            }
+            CommandOrEvent::Event(DecodedEventType::Ticker) => hid::tick(),
+            CommandOrEvent::Event(_) => {}
         }
     }
 }
