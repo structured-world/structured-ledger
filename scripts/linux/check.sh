@@ -122,9 +122,11 @@ tree=$(git -C "$root" write-tree)
 unset GIT_INDEX_FILE
 # The snapshot commit never leaves this run and represents no one, so it carries a
 # fixed identity: a machine without user.name/user.email must still run the gate.
+# It has no parent: the host checks out the tree alone, so the bundle carries no
+# history, which a shallow clone (CI) would not have to give.
 commit=$(GIT_AUTHOR_NAME=snapshot GIT_AUTHOR_EMAIL=snapshot@localhost \
     GIT_COMMITTER_NAME=snapshot GIT_COMMITTER_EMAIL=snapshot@localhost \
-    git -C "$root" commit-tree "$tree" -p HEAD -m "working tree snapshot")
+    git -C "$root" commit-tree "$tree" -m "working tree snapshot")
 git -C "$root" update-ref "$ref" "$commit"
 git -C "$root" bundle create "$work/snapshot.bundle" "$ref" 2>/dev/null
 # The remote half comes from the snapshot, so the run executes exactly the tree
