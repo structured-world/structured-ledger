@@ -253,15 +253,24 @@ def check_selection(device: CtapHidDevice, keepalives: KeepaliveLog, user, snaps
     # Confirm and refuse; the screen is compared with its snapshot while it waits.
     for confirm, expected in ((True, CtapError.ERR.SUCCESS), (False, CtapError.ERR.OPERATION_DENIED)):
 
+        # The answer runs in the timer's thread, where an exception (a failed snapshot check
+        # raises SystemExit) would end only that thread: it is kept and raised here instead.
+        failure: list[BaseException] = []
+
         def answer(confirm: bool = confirm) -> None:
-            if snapshot is not None and confirm:
-                snapshot()
-            user.answer(confirm)
+            try:
+                if snapshot is not None and confirm:
+                    snapshot()
+                user.answer(confirm)
+            except BaseException as error:
+                failure.append(error)
 
         timer = threading.Timer(1.0, answer)
         timer.start()
         status = selection(ctap)
         timer.join()
+        if failure:
+            raise failure[0]
         check(status == expected, f"selection: {'confirm' if confirm else 'refuse'} answers {status!r}")
 
     # No answer.
