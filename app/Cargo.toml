@@ -10,11 +10,13 @@ publish = false
 
 [dependencies]
 # `app_io_stack` runs the IO stack in the application, so the application can drive the FIDO HID
-# interface itself, and `Comm::next_command_or_event` hands it the ticker events its transport
-# clock needs; both come from this fork of the Ledger Rust SDK until the published crate has them.
+# interface itself, `Comm::next_command_or_event` hands it the ticker events its transport clock
+# needs, `AtomicStorage::get_or_init` initializes the zeroed NVM Speculos loads and
+# `AtomicStorage::settle` erases the copy an update retired; they come from this fork of the
+# Ledger Rust SDK until the published crate has them.
 # `sys` exposes the C SDK calls the application makes directly: the NBGL use cases its screens
 # start without the SDK's blocking wait, and the device PIN check.
-ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "77f7711b998d55967478ce846006e03029db2ce0", features = ["io_new", "nano_nbgl", "app_io_stack", "sys"] }
+ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "f7c289a5da04fdbbb9da1eaf45252cc44e948952", features = ["io_new", "nano_nbgl", "app_io_stack", "sys"] }
 structured-passkeys-ctap = { path = "../crates/ctap", default-features = false }
 zeroize = { version = "1.9.0", default-features = false }
 

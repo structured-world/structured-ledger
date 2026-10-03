@@ -3,7 +3,7 @@
 
 use zeroize::Zeroizing;
 
-use super::{APPLICATION_PATH, KeyRing};
+use super::{APPLICATION_PATH, DeviceKeys, KeyRing};
 use crate::crypto::{Crypto, CryptoError, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, Signature, TAG_LEN};
 use crate::soft::SoftCrypto;
 
@@ -50,6 +50,23 @@ fn credential_key_follows_the_hierarchy() {
             "045d31fcf65ebd9f1f252c1d9fd97dd225f3bf7dde1c4967b09457ca4156889a0407903bd11c6253ad24a56919c313027951af0759d9ce749aa8bbcf62290f718b"
         )[..]
     );
+}
+
+/// A non-discoverable device-only key for cs 33..33 under the device key 55..55 (derive.py:
+/// device_credential_key): the seed-recoverable derivation with K_dev in place of K_root, so it
+/// differs from the seed-recoverable key of the same cs.
+#[test]
+fn device_credential_key_derives_under_the_device_key() {
+    let crypto = crypto();
+    let keys = DeviceKeys::new(Zeroizing::new([0x55; KEY_LEN]));
+    let private_key = keys
+        .credential_key(&crypto, &[0x33; KEY_LEN])
+        .expect("in range");
+    assert_eq!(
+        private_key[..],
+        hex("4aedc94cefdba1c9fffc78ede132f84e44e50e437210f44369a362a22849210d")[..]
+    );
+    assert_eq!(format!("{keys:?}"), "DeviceKeys");
 }
 
 /// The software platform with the HKDF block for counter 0 replaced by 2^256 - 1, outside P-256's

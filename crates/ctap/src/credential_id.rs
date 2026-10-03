@@ -53,7 +53,10 @@ pub enum KeySource {
     /// Derived from the device seed and this credential seed: reproducible from the recovery
     /// phrase.
     Seed([u8; SEED_LEN]),
-    /// Stored in a device-only NVM slot, bound to the slot by its tag.
+    /// Derived from the device key `K_dev` and this credential seed: device-only, for a
+    /// non-discoverable credential, which takes no slot.
+    Device([u8; SEED_LEN]),
+    /// Stored in a device-only NVM slot, bound to the slot by its tag: a discoverable credential.
     Slot {
         /// The slot index.
         index: u16,
@@ -67,6 +70,7 @@ impl fmt::Debug for KeySource {
         match self {
             // The seed derives the private key; the slot index and tag are not secret.
             KeySource::Seed(_) => f.write_str("Seed(<redacted>)"),
+            KeySource::Device(_) => f.write_str("Device(<redacted>)"),
             KeySource::Slot { index, tag } => f
                 .debug_struct("Slot")
                 .field("index", index)
@@ -78,7 +82,7 @@ impl fmt::Debug for KeySource {
 
 impl Drop for KeySource {
     fn drop(&mut self) {
-        if let KeySource::Seed(cs) = self {
+        if let KeySource::Seed(cs) | KeySource::Device(cs) = self {
             cs.zeroize();
         }
     }
@@ -120,8 +124,8 @@ pub struct User {
 }
 
 /// Everything a credential ID carries. Plaintext keys: 1 origin (0 device-only, 1
-/// seed-recoverable), 2 alg, 3 cs, 4 slot, 5 slot_tag, 6 cred_protect, 7 rk, 8 user_id, 9 user
-/// name, 10 display name, 11 epoch.
+/// seed-recoverable), 2 alg, 3 cs (seed-recoverable, or device-only under `K_dev`), 4 slot, 5
+/// slot_tag, 6 cred_protect, 7 rk, 8 user_id, 9 user name, 10 display name, 11 epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credential {
     /// Where the private key comes from.
@@ -149,9 +153,24 @@ pub enum OpenError {
     Plaintext,
 }
 
-/// A field longer than its maximum, refused when sealing.
+/// Why a credential is refused when sealing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TooLong;
+pub enum SealError {
+    /// A field longer than its maximum.
+    TooLong,
+    /// A key source that does not fit the credential: a slot key belongs to a discoverable
+    /// credential, which its entry can delete, and a key under `K_dev` to a non-discoverable one.
+    KeySource,
+}
+
+/// Whether `key` may carry a credential that is discoverable or not, as `discoverable` says.
+const fn key_fits(key: &KeySource, discoverable: bool) -> bool {
+    match key {
+        KeySource::Seed(_) => true,
+        KeySource::Device(_) => !discoverable,
+        KeySource::Slot { .. } => discoverable,
+    }
+}
 
 /// The longest prefix of `text` of at most `max` bytes that ends on a character boundary.
 pub fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
@@ -173,7 +192,7 @@ fn aad<C: Crypto>(crypto: &C, rp_id: &str) -> [u8; 1 + KEY_LEN] {
     aad
 }
 
-fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, TooLong> {
+fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError> {
     let mut encoder = Encoder::new(output);
     let user = credential.user.as_ref();
     let names = user.map_or(0, |user| {
@@ -181,7 +200,7 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, TooLong> 
     });
     // origin, alg, key fields (1 or 2), cred_protect, rk, user_id, names, epoch.
     let key_fields = match credential.key {
-        KeySource::Seed(_) => 1,
+        KeySource::Seed(_) | KeySource::Device(_) => 1,
         KeySource::Slot { .. } => 2,
     };
     let entries = 5 + key_fields + usize::from(user.is_some()) + names;
@@ -190,6 +209,11 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, TooLong> 
         match &credential.key {
             KeySource::Seed(cs) => {
                 encoder.unsigned(1)?.unsigned(1)?;
+                encoder.unsigned(2)?.int(credential.alg)?;
+                encoder.unsigned(3)?.bytes(cs)?;
+            }
+            KeySource::Device(cs) => {
+                encoder.unsigned(1)?.unsigned(0)?;
                 encoder.unsigned(2)?.int(credential.alg)?;
                 encoder.unsigned(3)?.bytes(cs)?;
             }
@@ -218,7 +242,7 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, TooLong> 
             .unsigned(u64::from(credential.epoch))?;
         Ok(())
     };
-    write(&mut encoder).map_err(|_| TooLong)?;
+    write(&mut encoder).map_err(|_| SealError::TooLong)?;
     Ok(encoder.len())
 }
 
@@ -227,18 +251,22 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, TooLong> 
 ///
 /// # Errors
 ///
-/// [`TooLong`] for a user ID outside 1..=64 bytes.
+/// [`SealError::TooLong`] for a user ID outside 1..=64 bytes, [`SealError::KeySource`] for a
+/// key source that does not fit the credential's discoverability.
 pub fn seal<C: Crypto>(
     crypto: &mut C,
     keys: &KeyRing,
     rp_id: &str,
     credential: &Credential,
-) -> Result<Vec<u8>, TooLong> {
+) -> Result<Vec<u8>, SealError> {
+    if !key_fits(&credential.key, credential.user.is_some()) {
+        return Err(SealError::KeySource);
+    }
     let mut credential = credential.clone();
     if let Some(user) = &mut credential.user {
         // WebAuthn L3 §5.1.3 step 5: a user ID is 1..=64 bytes.
         if user.id.is_empty() || user.id.len() > MAX_USER_ID_LEN {
-            return Err(TooLong);
+            return Err(SealError::TooLong);
         }
         for name in [&mut user.name, &mut user.display_name]
             .into_iter()
@@ -346,6 +374,23 @@ fn optional_name(
     Ok(Some(text))
 }
 
+/// Reads the credential seed of a [`KeySource::Seed`] or [`KeySource::Device`] `key`, copied
+/// straight into it: no plain array holds the seed on its way there (the source is the zeroizing
+/// plaintext buffer).
+fn seed_source(
+    entries: &mut Entries<'_, '_>,
+    mut key: KeySource,
+) -> Result<KeySource, cbor::Error> {
+    let source = entries.value().bytes()?;
+    if source.len() != SEED_LEN {
+        return Err(NOT_A_CREDENTIAL);
+    }
+    if let KeySource::Seed(seed) | KeySource::Device(seed) = &mut key {
+        seed.copy_from_slice(source);
+    }
+    Ok(key)
+}
+
 /// Reads the plaintext map: the keys of its origin, in canonical order, and nothing else.
 fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
     let mut decoder = Decoder::new(plaintext);
@@ -354,29 +399,16 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
         let origin = entries.value().unsigned()?;
         expect_key(entries, 2)?;
         let alg = entries.value().int()?;
-        let key = match origin {
-            0 => {
-                expect_key(entries, 4)?;
+        let key = match (origin, next_int_key(entries)?) {
+            (0, Some(4)) => {
                 let index =
                     u16::try_from(entries.value().unsigned()?).map_err(|_| NOT_A_CREDENTIAL)?;
                 expect_key(entries, 5)?;
                 let tag = fixed_bytes(entries)?;
                 KeySource::Slot { index, tag }
             }
-            1 => {
-                expect_key(entries, 3)?;
-                let source = entries.value().bytes()?;
-                if source.len() != SEED_LEN {
-                    return Err(NOT_A_CREDENTIAL);
-                }
-                // Copied straight into the zeroizing key source: no plain array holds the seed
-                // on its way there. The source is the zeroizing plaintext buffer.
-                let mut key = KeySource::Seed([0; SEED_LEN]);
-                if let KeySource::Seed(seed) = &mut key {
-                    seed.copy_from_slice(source);
-                }
-                key
-            }
+            (0, Some(3)) => seed_source(entries, KeySource::Device([0; SEED_LEN]))?,
+            (1, Some(3)) => seed_source(entries, KeySource::Seed([0; SEED_LEN]))?,
             _ => return Err(NOT_A_CREDENTIAL),
         };
         expect_key(entries, 6)?;
@@ -405,6 +437,9 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
         } else {
             None
         };
+        if !key_fits(&key, user.is_some()) {
+            return Err(NOT_A_CREDENTIAL);
+        }
         if next != Some(11) {
             return Err(NOT_A_CREDENTIAL);
         }
