@@ -1,5 +1,6 @@
-//! Key hierarchy below the application's BIP32 node: the root key, the credential wrapping key
-//! and seed-recoverable credential keys.
+//! Key hierarchy below the application's BIP32 node (the root key, the credential wrapping key
+//! and seed-recoverable credential keys), and the keys of non-discoverable device-only
+//! credentials below the device key `K_dev`.
 //!
 //! Every key lives in a [`Zeroizing`] buffer for the duration of one command.
 
@@ -62,15 +63,60 @@ impl KeyRing {
         crypto: &C,
         cs: &[u8; KEY_LEN],
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
-        let credential = hkdf_sha256(crypto, &[], &self.root[..], b"credential-key", &[]);
-        for counter in 0..=u8::MAX {
-            let candidate = hkdf_sha256(crypto, cs, &credential[..], b"es256", &[counter]);
-            if is_p256_private_key(&candidate) {
-                return Ok(candidate);
-            }
-        }
-        Err(CryptoError::InvalidKey)
+        credential_key(crypto, &self.root, cs)
     }
+}
+
+/// The device key `K_dev`: random, kept only in NVM and erased by reset, so the keys of
+/// non-discoverable device-only credentials below it are not reproducible from the recovery
+/// phrase.
+pub struct DeviceKeys {
+    root: Zeroizing<[u8; KEY_LEN]>,
+}
+
+impl core::fmt::Debug for DeviceKeys {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("DeviceKeys")
+    }
+}
+
+impl DeviceKeys {
+    /// Wraps the device key read from NVM.
+    pub const fn new(device_key: Zeroizing<[u8; KEY_LEN]>) -> Self {
+        Self { root: device_key }
+    }
+
+    /// The private key of a non-discoverable device-only credential with credential seed `cs`:
+    /// the seed-recoverable derivation with `K_dev` in place of `K_root`.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::InvalidKey`] when all 256 counters are rejected, which happens with
+    /// probability below 2^-8000.
+    pub fn credential_key<C: Crypto>(
+        &self,
+        crypto: &C,
+        cs: &[u8; KEY_LEN],
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
+        credential_key(crypto, &self.root, cs)
+    }
+}
+
+/// `HKDF-SHA-256(HKDF-SHA-256(root, info = "credential-key"), salt = cs, info = "es256" || ctr)`
+/// for the first one-byte `ctr` from 0 that gives `0 < d < n`.
+fn credential_key<C: Crypto>(
+    crypto: &C,
+    root: &[u8; KEY_LEN],
+    cs: &[u8; KEY_LEN],
+) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
+    let credential = hkdf_sha256(crypto, &[], &root[..], b"credential-key", &[]);
+    for counter in 0..=u8::MAX {
+        let candidate = hkdf_sha256(crypto, cs, &credential[..], b"es256", &[counter]);
+        if is_p256_private_key(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(CryptoError::InvalidKey)
 }
 
 #[cfg(test)]

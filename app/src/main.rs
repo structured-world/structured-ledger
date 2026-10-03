@@ -1,16 +1,18 @@
-//! Device application: shows the home screen, runs the FIDO HID interface and answers the Ledger
-//! APDU channel.
+//! Device application: opens its NVM state, shows the home screen, runs the FIDO HID interface and
+//! answers the Ledger APDU channel.
 
 #![no_std]
 #![no_main]
 
 mod hid;
+mod storage;
 mod ui;
 
 use ledger_device_sdk::include_gif;
 use ledger_device_sdk::io::{self, CommError, CommandOrEvent, DecodedEventType, StatusWords};
 use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
 use structured_passkeys_ctap::ctap2::Authenticator;
+use structured_passkeys_ctap::storage::Store;
 use zeroize::Zeroize;
 
 ledger_device_sdk::set_panic!(ledger_device_sdk::exiting_panic);
@@ -49,6 +51,11 @@ extern "C" fn sample_main(_arg0: u32) {
     let mut authenticator = Authenticator::new(hid::SETTINGS);
     // SAFETY: `sample_main` runs once and is the only place that refers to the buffer.
     let response = unsafe { &mut *RESPONSE.get() };
+
+    // Opening the store formats a fresh install and finishes a reset or a replacement that a
+    // power loss interrupted.
+    // SAFETY: the only place that takes the NVM regions.
+    Store::open(unsafe { storage::NvmStorage::take() });
 
     // The home screen carries the version page and the quit action.
     let home = NbglHomeAndSettings::new().glyph(&HOME_GLYPH);
