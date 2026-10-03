@@ -141,7 +141,11 @@ fn fresh_nvm_is_formatted() {
     assert!(config.pin.is_none());
     assert_eq!(config.pin_retries, PIN_RETRIES);
     assert_eq!(store.remaining_discoverable(), 4);
-    assert_eq!(store.remaining_keys(), 2);
+    assert_eq!(
+        store.remaining_keys(),
+        1,
+        "one of the two is kept for replacements"
+    );
 }
 
 /// NVM of another layout version is wiped, slot by slot, before the new configuration is
@@ -252,10 +256,11 @@ fn a_full_index_refuses_a_new_user() {
     assert_eq!(store.storage.writes(), writes);
 }
 
-/// RP IDs up to 64 bytes are kept whole; a longer one is refused before anything is reserved.
+/// RP IDs up to 64 bytes are kept whole; a longer one is kept truncated on a character boundary
+/// and marked so (CTAP 2.2 §6.8.7 lets the stored RP ID be truncated; the RP ID hash stays whole).
 #[test]
-fn rp_ids_over_64_bytes_are_refused() {
-    let mut store = Store::open(MemoryStorage::new(1, 0));
+fn long_rp_ids_are_kept_truncated() {
+    let mut store = Store::open(MemoryStorage::new(2, 0));
     let longest = "a".repeat(MAX_RP_ID_LEN);
     let reservation = store
         .reserve(&RP_A, &longest, same_user("alice"))
@@ -263,12 +268,23 @@ fn rp_ids_over_64_bytes_are_refused() {
     store
         .commit(reservation, b"alice:1")
         .expect("an ID within bounds");
-    assert_eq!(store.entry(0).map(|entry| entry.rp_id), Some(&*longest));
-    let refused = store.reserve(&RP_A, &"a".repeat(MAX_RP_ID_LEN + 1), same_user("bob"));
+    let entry = store.entry(0).expect("alice");
+    assert_eq!((entry.rp_id, entry.rp_id_truncated), (&*longest, false));
+
+    // 63 ASCII bytes, then a two-byte character that would cross the 64-byte limit.
+    let long = format!("{}é.example", "b".repeat(MAX_RP_ID_LEN - 1));
+    let reservation = store
+        .reserve(&RP_B, &long, same_user("bob"))
+        .expect("a long RP ID is kept truncated");
+    store
+        .commit(reservation, b"bob:1")
+        .expect("an ID within bounds");
+    let entry = store.entry(1).expect("bob");
     assert_eq!(
-        refused.map(|reservation| reservation.id()),
-        Err(StoreError::TooLong)
+        (entry.rp_id, entry.rp_id_truncated),
+        (&*"b".repeat(MAX_RP_ID_LEN - 1), true)
     );
+    assert_eq!(entry.rp_id_hash, &RP_B);
 }
 
 /// A credential ID over the maximum length or empty is refused at commit, and the reservation's
@@ -276,7 +292,7 @@ fn rp_ids_over_64_bytes_are_refused() {
 #[test]
 fn oversized_credential_ids_are_refused() {
     let mut crypto = crypto();
-    let mut store = Store::open(MemoryStorage::new(1, 1));
+    let mut store = Store::open(MemoryStorage::new(1, 2));
     for id in [vec![0x01; MAX_CREDENTIAL_ID_LEN + 1], Vec::new()] {
         let reservation = store
             .reserve(&RP_A, "example.com", same_user("alice"))
@@ -322,7 +338,7 @@ fn a_device_key_opens_only_with_its_tag_and_entry() {
 #[test]
 fn a_key_without_an_entry_opens_at_once() {
     let mut crypto = crypto();
-    let mut store = Store::open(MemoryStorage::new(1, 1));
+    let mut store = Store::open(MemoryStorage::new(1, 2));
     let source = store
         .store_key(&mut crypto, None, &device_key(0x55))
         .expect("a free key slot");
@@ -339,7 +355,7 @@ fn a_key_without_an_entry_opens_at_once() {
 #[test]
 fn a_reused_key_slot_has_a_new_tag() {
     let mut crypto = crypto();
-    let mut store = Store::open(MemoryStorage::new(1, 1));
+    let mut store = Store::open(MemoryStorage::new(1, 2));
     let (entry, old) = add(
         &mut store,
         &mut crypto,
@@ -366,11 +382,12 @@ fn a_reused_key_slot_has_a_new_tag() {
     assert!(store.key(old_index, &old_tag).is_none());
 }
 
-/// Full key slots refuse another device-only key with KEY_STORE_FULL.
+/// Full key slots refuse another device-only key with KEY_STORE_FULL. The last free slot is
+/// kept for replacing a device-only credential, so a new one is refused when only it is left.
 #[test]
 fn full_key_slots_are_refused() {
     let mut crypto = crypto();
-    let mut store = Store::open(MemoryStorage::new(2, 1));
+    let mut store = Store::open(MemoryStorage::new(2, 2));
     add(
         &mut store,
         &mut crypto,
@@ -394,6 +411,60 @@ fn full_key_slots_are_refused() {
         1,
         "the reservation was released"
     );
+    assert_eq!(
+        store.store_key(&mut crypto, None, &device_key(3)),
+        Err(StoreError::Full),
+        "a non-discoverable key may not take the slot kept for replacements"
+    );
+    assert_eq!(store.remaining_keys(), 0);
+}
+
+/// With every key slot but the spare taken by device-only credentials, a new credential for an
+/// existing user still replaces its own (CTAP 2.2 §6.1.2 step 17.2): the old key holds its slot
+/// until the new entry is written, so the replacement uses the spare.
+#[test]
+fn a_device_credential_is_replaced_with_all_key_slots_taken() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::new(2, 3));
+    add(
+        &mut store,
+        &mut crypto,
+        &RP_A,
+        "alice",
+        "1",
+        Some(&device_key(1)),
+    )
+    .expect("room");
+    add(
+        &mut store,
+        &mut crypto,
+        &RP_B,
+        "bob",
+        "1",
+        Some(&device_key(2)),
+    )
+    .expect("room");
+    assert_eq!(store.remaining_keys(), 0);
+    let (_, key) = add(
+        &mut store,
+        &mut crypto,
+        &RP_A,
+        "alice",
+        "2",
+        Some(&device_key(3)),
+    )
+    .expect("the replacement uses the spare");
+    let (index, tag) = slot_key(&key.expect("device-only"));
+    assert_eq!(
+        store.key(index, &tag).map(|key| *key.private_key),
+        Some([3; KEY_LEN])
+    );
+    assert_eq!(
+        store.remaining_keys(),
+        0,
+        "the old key's slot is the spare now"
+    );
+    assert_no_residue(&store);
 }
 
 /// Replacing a device-only credential wipes its key: the old credential ID stops working at
@@ -422,7 +493,11 @@ fn replacing_a_device_credential_wipes_its_key() {
     .expect("replaces");
     let (index, tag) = slot_key(&old.expect("device-only"));
     assert!(store.key(index, &tag).is_none());
-    assert_eq!(store.remaining_keys(), 1);
+    assert_eq!(
+        store.remaining_keys(),
+        0,
+        "one slot holds the new key, the freed one is the spare"
+    );
     assert_no_residue(&store);
 }
 
@@ -431,7 +506,7 @@ fn replacing_a_device_credential_wipes_its_key() {
 #[test]
 fn removal_wipes_the_entry_and_its_key() {
     let mut crypto = crypto();
-    let mut store = Store::open(MemoryStorage::new(2, 1));
+    let mut store = Store::open(MemoryStorage::new(2, 2));
     let (first, _) = add(&mut store, &mut crypto, &RP_A, "alice", "1", None).expect("room");
     add(&mut store, &mut crypto, &RP_A, "alice", "2", None).expect("replaces");
     assert!(!store.remove(first), "replaced since");
@@ -484,7 +559,7 @@ fn a_released_reservation_changes_nothing() {
 #[test]
 fn reset_empties_everything_and_raises_the_epoch() {
     let mut crypto = crypto();
-    let mut store = Store::open(MemoryStorage::new(2, 2));
+    let mut store = Store::open(MemoryStorage::new(2, 3));
     store.write_config(&Config {
         epoch: 3,
         always_uv: true,
@@ -534,6 +609,70 @@ fn reset_never_wraps_the_epoch() {
     assert_eq!(store.config().epoch, u32::MAX);
 }
 
+/// A slot past the index is no entry, and removing an id that names one does nothing, instead
+/// of indexing past the region.
+#[test]
+fn slots_past_the_index_are_no_entry() {
+    let mut store = Store::open(MemoryStorage::new(1, 0));
+    assert!(store.entry(1).is_none());
+    assert!(store.entry(u16::MAX).is_none());
+    assert!(!store.remove(EntryId {
+        slot: 5,
+        sequence: 0
+    }));
+}
+
+/// An entry id never names a later credential: creation sequences keep growing across a
+/// reopen after the newest entry was removed, and across a reset.
+#[test]
+fn entry_ids_are_never_reused() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::new(1, 0));
+    let (first, _) = add(&mut store, &mut crypto, &RP_A, "alice", "1", None).expect("room");
+    assert!(store.remove(first));
+    let mut store = Store::open(store.into_storage());
+    let (second, _) = add(&mut store, &mut crypto, &RP_A, "bob", "1", None).expect("room");
+    assert_eq!(second.slot, first.slot);
+    assert_ne!(second, first, "a reopen does not rewind the sequence");
+    store.reset().expect("counters far from wrapping");
+    let (third, _) = add(&mut store, &mut crypto, &RP_A, "carol", "1", None).expect("room");
+    assert!(
+        third.sequence > second.sequence,
+        "a reset does not rewind the sequence"
+    );
+}
+
+/// After the double has lost power, a later limit does not bring it back: only `power_on` does.
+#[test]
+fn power_stays_lost_until_power_on() {
+    let mut storage = MemoryStorage::new(1, 1);
+    storage.lose_power_after(0);
+    storage.lose_power_after(5);
+    storage.write_config(&[1; super::CONFIG_LEN]);
+    assert_eq!(storage.writes(), 0);
+    assert_eq!(storage.config(), &[0; super::CONFIG_LEN]);
+    storage.power_on();
+    storage.write_config(&[1; super::CONFIG_LEN]);
+    assert_eq!(storage.config(), &[1; super::CONFIG_LEN]);
+}
+
+/// The double's and the store's debug output never print a record: key slots hold private keys
+/// and CredRandom, the configuration the PIN verifier.
+#[test]
+fn debug_output_hides_the_records() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::new(1, 2));
+    store.write_config(&Config {
+        pin: Some(PinVerifier::new([0x5A; 16])),
+        ..Config::after_reset(0)
+    });
+    store
+        .store_key(&mut crypto, None, &device_key(0x5A))
+        .expect("room");
+    let printed = format!("{store:?}");
+    assert!(!printed.contains("90, 90"), "no record bytes: {printed}");
+}
+
 /// Runs `operation` on the state `setup` builds with power lost after every possible number of
 /// writes; after power returns and the store reopens, the state is the one before the operation
 /// or the one after it, and nothing retired is left in NVM.
@@ -570,7 +709,7 @@ fn power_loss_leaves_old_or_new(
 /// Two discoverable credentials of RP A (one device-only), one of RP B, a non-discoverable
 /// device-only key and a PIN.
 fn populated(crypto: &mut SoftCrypto) -> MemoryStorage {
-    let mut store = Store::open(MemoryStorage::new(4, 3));
+    let mut store = Store::open(MemoryStorage::new(4, 4));
     store.write_config(&Config {
         epoch: 1,
         always_uv: true,

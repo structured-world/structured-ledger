@@ -15,7 +15,9 @@ use alloc::vec::Vec;
 use core::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::credential_id::{KeySource, MAX_CREDENTIAL_ID_LEN, SLOT_TAG_LEN};
+use crate::credential_id::{
+    KeySource, MAX_CREDENTIAL_ID_LEN, SLOT_TAG_LEN, truncate_on_char_boundary,
+};
 use crate::crypto::{Crypto, KEY_LEN};
 use crate::ctap2::StatusCode;
 
@@ -37,7 +39,8 @@ pub const PIN_RETRIES: u8 = 8;
 /// Marks a slot record in use; a free slot is all zeros.
 const USED: u8 = 1;
 
-// Configuration record: version, generation, epoch, alwaysUv, PIN retries, PIN set, verifier.
+// Configuration record: version, generation, epoch, alwaysUv, PIN retries, PIN set, verifier,
+// creation sequence limit.
 const CONFIG_VERSION: usize = 0;
 const CONFIG_GENERATION: usize = 1;
 const CONFIG_EPOCH: usize = 5;
@@ -45,8 +48,17 @@ const CONFIG_ALWAYS_UV: usize = 9;
 const CONFIG_PIN_RETRIES: usize = 10;
 const CONFIG_PIN_SET: usize = 11;
 const CONFIG_PIN: usize = 12;
+const CONFIG_SEQUENCE_LIMIT: usize = CONFIG_PIN + PIN_VERIFIER_LEN;
 /// Length of the configuration record.
-pub const CONFIG_LEN: usize = CONFIG_PIN + PIN_VERIFIER_LEN;
+pub const CONFIG_LEN: usize = CONFIG_SEQUENCE_LIMIT + 4;
+
+/// Creation sequences are handed out in blocks: the configuration records the end of the
+/// current block, so one configuration write covers this many creations and a sequence below
+/// the recorded limit is never handed out again, also after a reopen or a reset.
+const SEQUENCE_BLOCK: u32 = 32;
+
+/// High bit of the stored RP ID length: the RP ID was longer and is kept truncated.
+const RP_ID_TRUNCATED: u8 = 0x80;
 
 // Index entry: state, generation, creation sequence, RP ID hash, RP ID, credential ID.
 const ENTRY_STATE: usize = 0;
@@ -78,6 +90,8 @@ pub const KEY_SLOT_LEN: usize = KEY_CRED_RANDOM + KEY_LEN;
 /// implements it with the SDK's atomic storage; [`MemoryStorage`] is the host double.
 ///
 /// A record never written reads as all zeros. Slot numbers passed in are below the slot count.
+/// A write leaves no earlier value of the record anywhere in NVM: key slots hold private keys
+/// and the configuration holds the PIN verifier, so a wiped record must be gone, not shadowed.
 pub trait Storage {
     /// The configuration record.
     fn config(&self) -> &[u8; CONFIG_LEN];
@@ -182,8 +196,11 @@ pub struct IndexEntry<'a> {
     pub id: EntryId,
     /// SHA-256 of the RP ID.
     pub rp_id_hash: &'a [u8; KEY_LEN],
-    /// The RP ID, kept so credential management can list relying parties without a key.
+    /// The RP ID, kept so credential management can list relying parties without a key; at
+    /// most [`MAX_RP_ID_LEN`] bytes.
     pub rp_id: &'a str,
+    /// Whether `rp_id` is the start of a longer RP ID, cut on a character boundary.
+    pub rp_id_truncated: bool,
     /// The full credential ID.
     pub credential_id: &'a [u8],
 }
@@ -223,7 +240,10 @@ pub struct Reservation {
     generation: u32,
     rp_id_hash: [u8; KEY_LEN],
     rp_id: [u8; MAX_RP_ID_LEN],
+    /// The stored length, with [`RP_ID_TRUNCATED`] set for a truncated RP ID.
     rp_id_len: u8,
+    /// The entry this one replaces owns a device-only key, which its commit frees.
+    replaces_key: bool,
 }
 
 impl Reservation {
@@ -262,7 +282,7 @@ fn is_zero(record: &[u8]) -> bool {
 }
 
 /// Slot numbers are 16-bit in records and credential IDs; a region with more slots uses the
-/// first 65536.
+/// first 65535.
 fn slot_count(slots: usize) -> u16 {
     u16::try_from(slots).unwrap_or(u16::MAX)
 }
@@ -275,6 +295,8 @@ pub struct Store<S> {
     generation: u32,
     /// The creation sequence of the next reservation; above `u32::MAX` when exhausted.
     next_sequence: u64,
+    /// The end of the block of creation sequences recorded in the configuration.
+    sequence_limit: u32,
 }
 
 impl<S: Storage> Store<S> {
@@ -299,12 +321,14 @@ impl<S: Storage> Store<S> {
                 storage,
                 generation: 0,
                 next_sequence: 0,
+                sequence_limit: 0,
             };
             store.write_config(&Config::after_reset(0));
             return store;
         }
         let mut store = Self {
             generation: read_u32(storage.config(), CONFIG_GENERATION),
+            sequence_limit: read_u32(storage.config(), CONFIG_SEQUENCE_LIMIT),
             storage,
             next_sequence: 0,
         };
@@ -345,8 +369,9 @@ impl<S: Storage> Store<S> {
         record[CONFIG_PIN_RETRIES] = config.pin_retries;
         if let Some(pin) = &config.pin {
             record[CONFIG_PIN_SET] = USED;
-            record[CONFIG_PIN..].copy_from_slice(&pin.0);
+            record[CONFIG_PIN..CONFIG_SEQUENCE_LIMIT].copy_from_slice(&pin.0);
         }
+        write_u32(&mut record[..], CONFIG_SEQUENCE_LIMIT, self.sequence_limit);
         self.storage.write_config(&record);
     }
 
@@ -378,8 +403,15 @@ impl<S: Storage> Store<S> {
             .count()
     }
 
-    /// Free device-only key slots.
+    /// Device-only key slots free for new credentials. One free slot is always kept back for
+    /// replacing a device-only credential, whose old key holds its slot until the new entry is
+    /// written; it is not counted.
     pub fn remaining_keys(&self) -> usize {
+        // Clamped at 0 by design: with no free slot or only the spare, nothing is available.
+        self.free_keys().saturating_sub(1)
+    }
+
+    fn free_keys(&self) -> usize {
         (0..slot_count(self.storage.key_slots()))
             .filter(|&slot| self.key_is_free(slot))
             .count()
@@ -387,11 +419,15 @@ impl<S: Storage> Store<S> {
 
     /// The entry in `slot`, if the slot holds one.
     pub fn entry(&self, slot: u16) -> Option<IndexEntry<'_>> {
+        if slot >= slot_count(self.storage.index_slots()) {
+            return None;
+        }
         let record = self.storage.index_entry(usize::from(slot));
         if record[ENTRY_STATE] != USED || read_u32(record, ENTRY_GENERATION) != self.generation {
             return None;
         }
-        let rp_id_len = usize::from(record[ENTRY_RP_ID_LEN]);
+        let rp_id_truncated = record[ENTRY_RP_ID_LEN] & RP_ID_TRUNCATED != 0;
+        let rp_id_len = usize::from(record[ENTRY_RP_ID_LEN] & !RP_ID_TRUNCATED);
         let credential_id_len = usize::from(read_u16(record, ENTRY_CREDENTIAL_ID_LEN));
         // The device wrote these within bounds; a record that is not is treated as free and
         // wiped on the next open.
@@ -409,6 +445,7 @@ impl<S: Storage> Store<S> {
             },
             rp_id_hash,
             rp_id,
+            rp_id_truncated,
             credential_id: &record[ENTRY_CREDENTIAL_ID..ENTRY_CREDENTIAL_ID + credential_id_len],
         })
     }
@@ -429,24 +466,29 @@ impl<S: Storage> Store<S> {
     }
 
     /// Chooses the slot of a new discoverable credential: the slot of the credential that
-    /// `same_user` recognises for this RP, which the new one replaces (CTAP 2.2 §6.1.2 step 16),
-    /// or else a free slot. `same_user` opens a stored credential ID and compares its user ID.
+    /// `same_user` recognises for this RP, which the new one replaces (CTAP 2.2 §6.1.2 step
+    /// 17.2), or else a free slot. `same_user` opens a stored credential ID and compares its user
+    /// ID. An RP ID over [`MAX_RP_ID_LEN`] bytes is kept truncated on a character boundary, as
+    /// CTAP 2.2 §6.8.7 allows for the stored RP ID; `rp_id_hash` stays the full RP ID's.
     ///
     /// # Errors
     ///
-    /// [`StoreError::TooLong`] for an RP ID over [`MAX_RP_ID_LEN`] bytes, [`StoreError::Full`]
-    /// without a slot, [`StoreError::Exhausted`] when creation sequences ran out.
+    /// [`StoreError::Full`] without a slot, [`StoreError::Exhausted`] when creation sequences
+    /// ran out.
     pub fn reserve(
         &mut self,
         rp_id_hash: &[u8; KEY_LEN],
         rp_id: &str,
         mut same_user: impl FnMut(&IndexEntry<'_>) -> bool,
     ) -> Result<Reservation, StoreError> {
+        let kept = truncate_on_char_boundary(rp_id, MAX_RP_ID_LEN);
         let mut stored_rp_id = [0u8; MAX_RP_ID_LEN];
-        stored_rp_id
-            .get_mut(..rp_id.len())
-            .ok_or(StoreError::TooLong)?
-            .copy_from_slice(rp_id.as_bytes());
+        stored_rp_id[..kept.len()].copy_from_slice(kept.as_bytes());
+        // At most MAX_RP_ID_LEN = 64, below the flag bit.
+        let mut rp_id_len = u8::try_from(kept.len()).map_err(|_| StoreError::TooLong)?;
+        if kept.len() < rp_id.len() {
+            rp_id_len |= RP_ID_TRUNCATED;
+        }
         let sequence = u32::try_from(self.next_sequence).map_err(|_| StoreError::Exhausted)?;
         let mut free = None;
         let mut replaced = None;
@@ -464,19 +506,37 @@ impl<S: Storage> Store<S> {
             }
         }
         let slot = replaced.or(free).ok_or(StoreError::Full)?;
+        let replaces_key = replaced
+            .and_then(|slot| self.entry(slot))
+            .is_some_and(|entry| self.owns_key(entry.id));
+        if sequence >= self.sequence_limit {
+            // Record the next block before handing out its first sequence. Capped at u32::MAX,
+            // past which sequences are exhausted.
+            let limit = sequence.saturating_add(SEQUENCE_BLOCK);
+            if sequence >= limit {
+                return Err(StoreError::Exhausted);
+            }
+            self.sequence_limit = limit;
+            self.write_config(&self.config());
+        }
         self.next_sequence = u64::from(sequence) + 1;
         Ok(Reservation {
             id: EntryId { slot, sequence },
             generation: self.generation,
             rp_id_hash: *rp_id_hash,
             rp_id: stored_rp_id,
-            rp_id_len: u8::try_from(rp_id.len()).map_err(|_| StoreError::TooLong)?,
+            rp_id_len,
+            replaces_key,
         })
     }
 
     /// Stores the secrets of a new device-only credential in a free key slot under a fresh tag.
     /// `owner` is the reservation of a discoverable credential; the key counts only once that
     /// reservation is committed. A non-discoverable credential has no owner.
+    ///
+    /// The last free slot is kept for replacing a device-only credential (CTAP 2.2 §6.1.2 step
+    /// 17.2): the old key holds its slot until the new entry is written, so such a replacement
+    /// may take it, and every other key needs a second free slot.
     ///
     /// # Errors
     ///
@@ -490,6 +550,14 @@ impl<S: Storage> Store<S> {
     ) -> Result<KeySource, StoreError> {
         if owner.is_some_and(|owner| owner.generation != self.generation) {
             return Err(StoreError::Stale);
+        }
+        let needed = if owner.is_some_and(|owner| owner.replaces_key) {
+            1
+        } else {
+            2
+        };
+        if self.free_keys() < needed {
+            return Err(StoreError::Full);
         }
         let index = (0..slot_count(self.storage.key_slots()))
             .find(|&slot| self.key_is_free(slot))
@@ -533,7 +601,7 @@ impl<S: Storage> Store<S> {
             return Err(StoreError::TooLong);
         }
         let id = reservation.id;
-        let rp_id_len = usize::from(reservation.rp_id_len);
+        let rp_id_len = usize::from(reservation.rp_id_len & !RP_ID_TRUNCATED);
         let mut record = [0u8; INDEX_ENTRY_LEN];
         record[ENTRY_STATE] = USED;
         write_u32(&mut record, ENTRY_GENERATION, self.generation);
@@ -592,7 +660,19 @@ impl<S: Storage> Store<S> {
         })
     }
 
-    /// A key slot record of this generation, live or waiting for its entry.
+    /// Whether a live key of this generation belongs to the entry `id`.
+    fn owns_key(&self, id: EntryId) -> bool {
+        (0..slot_count(self.storage.key_slots())).any(|key| {
+            let record = self.storage.key_slot(usize::from(key));
+            self.key_is_live(key)
+                && record[KEY_OWNED] == USED
+                && read_u16(record, KEY_OWNER_SLOT) == id.slot
+                && read_u32(record, KEY_OWNER_SEQUENCE) == id.sequence
+        })
+    }
+
+    /// Whether the key slot is free: not in use, or written under an earlier generation. A key
+    /// of this generation counts as taken, also while it waits for its entry.
     fn key_is_free(&self, slot: u16) -> bool {
         let record = self.storage.key_slot(usize::from(slot));
         record[KEY_STATE] != USED || read_u32(record, KEY_GENERATION) != self.generation
@@ -653,7 +733,9 @@ impl<S: Storage> Store<S> {
                 self.storage.write_key_slot(slot, &[0; KEY_SLOT_LEN]);
             }
         }
-        self.next_sequence = newest.map_or(0, |sequence| u64::from(sequence) + 1);
+        // Every sequence below the recorded limit may have been handed out already.
+        let after_newest = newest.map_or(0, |sequence| u64::from(sequence) + 1);
+        self.next_sequence = after_newest.max(u64::from(self.sequence_limit));
     }
 }
 

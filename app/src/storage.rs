@@ -1,6 +1,8 @@
 //! The NVM regions of [`Storage`] as statics in the application's `.nvm_data`, each record an SDK
 //! [`AtomicStorage`]: two copies with validity flags, so after a power loss a record holds the
-//! value before a write or the value written.
+//! value before a write or the value written. An update writes the other copy and only
+//! invalidates the current one, whose bytes stay; records that hold secrets are therefore
+//! written twice, so both copies hold the new value and no retired key or PIN verifier is left.
 
 use ledger_device_sdk::NVMData;
 use ledger_device_sdk::nvm::{AtomicStorage, SingleStorage};
@@ -9,8 +11,8 @@ use structured_passkeys_ctap::storage::{CONFIG_LEN, INDEX_ENTRY_LEN, KEY_SLOT_LE
 /// Discoverable index slots: at least 64 on every device.
 pub const INDEX_SLOTS: usize = 64;
 /// Device-only key slots: one per index slot, so every discoverable credential can be
-/// device-only.
-pub const KEY_SLOTS: usize = 64;
+/// device-only, plus the spare a replacement writes its new key into before the old one goes.
+pub const KEY_SLOTS: usize = INDEX_SLOTS + 1;
 
 type Record<const N: usize> = AtomicStorage<[u8; N]>;
 
@@ -68,6 +70,8 @@ impl Storage for NvmStorage {
     }
 
     fn write_config(&mut self, record: &[u8; CONFIG_LEN]) {
+        // The PIN verifier: the second update overwrites the copy the first one retired.
+        self.config.update(record);
         self.config.update(record);
     }
 
@@ -92,6 +96,8 @@ impl Storage for NvmStorage {
     }
 
     fn write_key_slot(&mut self, slot: usize, record: &[u8; KEY_SLOT_LEN]) {
+        // Private key and CredRandom: the second update overwrites the copy the first retired.
+        self.keys[slot].update(record);
         self.keys[slot].update(record);
     }
 }

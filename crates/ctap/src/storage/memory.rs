@@ -2,14 +2,16 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt;
 use zeroize::Zeroize;
 
 use super::{CONFIG_LEN, INDEX_ENTRY_LEN, KEY_SLOT_LEN, Storage};
 
 /// NVM regions held in RAM. Writes are atomic per record, as on the device; after
 /// [`MemoryStorage::lose_power_after`] the given number of writes land and every later one is
-/// lost, until [`MemoryStorage::power_on`]. Key slots are zeroized on drop.
-#[derive(Clone, Debug)]
+/// lost, until [`MemoryStorage::power_on`]. Key slots are zeroized on drop, and the `Debug`
+/// output shows no record: they hold keys and the PIN verifier.
+#[derive(Clone)]
 pub struct MemoryStorage {
     config: [u8; CONFIG_LEN],
     index: Vec<[u8; INDEX_ENTRY_LEN]>,
@@ -30,8 +32,12 @@ impl MemoryStorage {
         }
     }
 
-    /// Lets `writes` more writes land and loses every one after them.
+    /// Lets `writes` more writes land and loses every one after them. Once power is lost, it
+    /// stays lost until [`MemoryStorage::power_on`], whatever later limit is set.
     pub fn lose_power_after(&mut self, writes: usize) {
+        if self.power_until.is_some_and(|until| self.writes >= until) {
+            return;
+        }
         self.power_until = Some(self.writes + writes);
     }
 
@@ -52,6 +58,17 @@ impl MemoryStorage {
         }
         self.writes += 1;
         true
+    }
+}
+
+impl fmt::Debug for MemoryStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoryStorage")
+            .field("index_slots", &self.index.len())
+            .field("key_slots", &self.keys.len())
+            .field("writes", &self.writes)
+            .field("power_until", &self.power_until)
+            .finish_non_exhaustive()
     }
 }
 
