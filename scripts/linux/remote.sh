@@ -37,6 +37,22 @@ alive() {
     [[ "$cmdline" == *"$dir/remote.sh run $dir "* ]]
 }
 
+# Whether a process of group $1 is still running. A zombie member does not
+# count: `kill -0` still finds it until its parent reaps it, which an orphan in
+# a container without a reaping init never gets.
+group_running() {
+    local file stat state pgrp
+    for file in /proc/[0-9]*/stat; do
+        stat=$(cat "$file" 2>/dev/null) || continue
+        # The fields after the command name, which may hold spaces and parentheses.
+        read -r state _ pgrp _ <<<"${stat##*) }"
+        if [[ "$pgrp" == "$1" && "$state" != Z ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 case "$mode" in
     launch)
         setsid nohup bash "$dir/remote.sh" run "$dir" "${3:?ref}" "${4:?action}" \
@@ -65,7 +81,7 @@ case "$mode" in
             group=$(cat "$dir/pid")
             kill -TERM -- "-$group" 2>/dev/null
             for _ in $(seq 1 50); do
-                kill -0 -- "-$group" 2>/dev/null || break
+                group_running "$group" || break
                 sleep 0.2
             done
         fi

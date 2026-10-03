@@ -126,10 +126,33 @@ check_ended() {
     ! kill -0 "$check" 2>/dev/null
 }
 
-# The process group $1 has no process left.
+# The process group $1 has no process left running. A zombie member does not
+# count: `kill -0` still finds it until its parent reaps it, which an orphan in
+# a container without a reaping init never gets.
 group_gone() {
-    ! kill -0 -- "-$1" 2>/dev/null
+    local file stat state pgrp
+    for file in /proc/[0-9]*/stat; do
+        stat=$(cat "$file" 2>/dev/null) || continue
+        # The fields after the command name, which may hold spaces and parentheses.
+        read -r state _ pgrp _ <<<"${stat##*) }"
+        if [[ "$pgrp" == "$1" && "$state" != Z ]]; then
+            return 1
+        fi
+    done
 }
+
+# A group whose only process is a zombie has nothing left running: where no init
+# reaps orphans (a container), a stopped run stays a zombie. The setsid child
+# below leads its own group and exits; its parent, replaced by sleep, never
+# reaps it.
+bash -c 'setsid sleep 0 & echo "$!" >"$1"; exec sleep 3' _ "$tmp/zombie" &
+holder=$!
+sleep 0.5
+zombie=$(cat "$tmp/zombie")
+if kill -0 -- "-$zombie" 2>/dev/null; then
+    group_gone "$zombie" || fail "zombie: a group of a zombie counts as running"
+fi
+wait "$holder" || true
 
 # Dropped connections: the snapshot upload, the start (after it ran), and polls.
 FAKE_SSH_DROPS="2b,4a,6b,7a,9b" FAKE_DOCKER_SECONDS=3 start_check drops
