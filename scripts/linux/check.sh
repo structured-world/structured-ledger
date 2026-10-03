@@ -91,6 +91,18 @@ remote() {
     done
 }
 
+# Uploads the local file $1 to the remote path $2. Every attempt writes a file of
+# its own and installs it only when it arrived whole (cksum, which counts the
+# bytes too): an attempt whose connection was cut can still run on the host
+# after its retry, and must not replace the file with a truncated one.
+# shellcheck disable=SC2029 # the command is built here, paths expanded on purpose
+upload() {
+    local sum
+    sum=$(cksum <"$1")
+    remote "part=$2.part.\$\$; cat > \$part && [ \"\$(cksum < \$part)\" = \"$sum\" ] &&
+        mv -f \$part $2 || { rm -f \$part; exit 1; }" "$1"
+}
+
 # Removes the local snapshot and the remote directory, through `remote.sh stop`
 # once it is there, which first stops a run still alive and its containers; a
 # failed remote removal fails the run.
@@ -145,9 +157,8 @@ git -C "$root" show "$commit:scripts/linux/remote.sh" >"$work/remote.sh"
 # owner token. The directory is built with its token under a staging name and
 # renamed into place in one step, so it never exists without the token; a retry
 # finds it marked as this run's, or rebuilds the staging directory and renames
-# again. The rename takes an empty directory (a cut-off attempt of an earlier
-# version left nothing in it) and fails on a directory an earlier run left with
-# its files, which is refused.
+# again. The rename takes an empty directory, which holds nothing of any run,
+# and fails on a directory an earlier run left with its files, which is refused.
 remote_pending=1
 if ! remote "[ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ] || {
     mkdir -p -m 700 $remote_dir.new && echo $owner > $remote_dir.new/owner &&
@@ -155,8 +166,8 @@ if ! remote "[ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ] || {
     echo "$destination:$remote_dir exists already and is not this run's" >&2
     exit 1
 fi
-remote "cat > $remote_dir/snapshot.bundle" "$work/snapshot.bundle"
-remote "cat > $remote_dir/remote.sh" "$work/remote.sh"
+upload "$work/snapshot.bundle" "$remote_dir/snapshot.bundle"
+upload "$work/remote.sh" "$remote_dir/remote.sh"
 
 echo "snapshot ${commit:0:12} of $(git -C "$root" rev-parse --short HEAD) with local changes"
 echo "remote run in $destination:$remote_dir"
