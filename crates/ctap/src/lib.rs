@@ -7,6 +7,7 @@
 //! - [`cbor`]: the CTAP2 canonical CBOR encoding.
 //! - [`ctap2`]: CTAP2 command dispatch, status codes and authenticatorGetInfo.
 //! - [`crypto`]: the cryptographic platform the device implements, and HKDF on top of it.
+//! - [`ui`]: the screens a ceremony waits on.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -21,3 +22,4 @@ pub mod ctaphid;
 pub mod keys;
 #[cfg(feature = "soft")]
 pub mod soft;
+pub mod ui;

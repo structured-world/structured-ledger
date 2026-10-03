@@ -2,22 +2,38 @@
 //! authenticatorGetInfo (§6.4).
 //!
 //! A request is the command byte followed by its CBOR parameters; a response is a status byte
-//! followed, on success, by the CBOR response.
+//! followed, on success, by the CBOR response. A request is parsed into a [`Command`] first, which
+//! owns what it needs: a command that waits for the user then runs while the transport keeps
+//! receiving into the buffer the request came in.
 //!
 //! # Examples
 //!
 //! ```
 //! use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings, StatusCode};
+//! use structured_passkeys_ctap::ui::{Answer, Prompt, Ui, Verification};
+//!
+//! /// A user who confirms everything and has no PIN to enter.
+//! struct Present;
+//!
+//! impl Ui for Present {
+//!     fn confirm(&mut self, _prompt: Prompt, _timeout_ms: u32) -> Answer {
+//!         Answer::Confirmed
+//!     }
+//!     fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
+//!         Verification::Blocked
+//!     }
+//! }
 //!
 //! let max_msg_size = MaxMsgSize::try_from(1024).expect("at least 1024");
 //! let mut authenticator = Authenticator::new(Settings { max_msg_size });
 //! let mut response = [0u8; 128];
-//! let length = authenticator.process(&[0x04], &mut response);
+//! let length = authenticator.process(&[0x04], &mut Present, &mut response);
 //! assert_eq!(response[0], StatusCode::Ok as u8);
 //! assert!(length > 1);
 //! ```
 
 use crate::cbor::{self, Encoder, Full};
+use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
 /// The AAGUID of this application, the same on every device (WebAuthn L3 §6.5.1).
 pub const AAGUID: [u8; 16] = [
@@ -256,6 +272,15 @@ pub struct Settings {
     pub max_msg_size: MaxMsgSize,
 }
 
+/// A parsed request, owning everything its execution needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// authenticatorGetInfo (§6.4).
+    GetInfo,
+    /// authenticatorSelection (§6.9).
+    Selection,
+}
+
 /// The CTAP2 command processor.
 #[derive(Debug)]
 pub struct Authenticator {
@@ -268,20 +293,67 @@ impl Authenticator {
         Self { settings }
     }
 
-    /// Processes one request (command byte and CBOR parameters) and writes the response
-    /// (status byte, then the CBOR response on success) into `response`, returning its length.
-    /// A response that does not fit is replaced by CTAP1_ERR_OTHER; an empty `response` gets
-    /// nothing.
-    pub fn process(&mut self, request: &[u8], response: &mut [u8]) -> usize {
+    /// Processes one request (command byte and CBOR parameters) and writes the response into
+    /// `response`, returning its length: [`Authenticator::parse`], then
+    /// [`Authenticator::execute`].
+    pub fn process<U: Ui>(&mut self, request: &[u8], ui: &mut U, response: &mut [u8]) -> usize {
+        let command = self.parse(request);
+        self.execute(command, ui, response)
+    }
+
+    /// Parses one request (command byte and CBOR parameters) into the command it asks for, or
+    /// the status that refuses it.
+    ///
+    /// # Errors
+    ///
+    /// The CTAP status of a request that cannot run: no command byte, a command not
+    /// implemented, or parameters it does not take.
+    pub fn parse(&self, request: &[u8]) -> Result<Command, StatusCode> {
+        // A CTAPHID_CBOR message carries at least the command byte (§11.2.9.1.2).
+        let (&code, parameters) = request.split_first().ok_or(StatusCode::InvalidLength)?;
+        match CommandCode::try_from(code) {
+            // §6.4 and §6.9 define no parameters.
+            Ok(command @ (CommandCode::GetInfo | CommandCode::Selection)) => {
+                if !parameters.is_empty() {
+                    return Err(StatusCode::InvalidLength);
+                }
+                Ok(match command {
+                    CommandCode::Selection => Command::Selection,
+                    _ => Command::GetInfo,
+                })
+            }
+            // §8.1: a command code the authenticator does not implement is
+            // CTAP1_ERR_INVALID_COMMAND.
+            Ok(
+                CommandCode::MakeCredential
+                | CommandCode::GetAssertion
+                | CommandCode::ClientPin
+                | CommandCode::Reset
+                | CommandCode::GetNextAssertion
+                | CommandCode::BioEnrollment
+                | CommandCode::CredentialManagement
+                | CommandCode::LargeBlobs
+                | CommandCode::Config,
+            )
+            | Err(UnknownCommand(_)) => Err(StatusCode::InvalidCommand),
+        }
+    }
+
+    /// Runs a parsed request, asking `ui` when the command waits for the user, and writes the
+    /// response (status byte, then the CBOR response on success) into `response`, returning its
+    /// length. A response that does not fit is replaced by CTAP1_ERR_OTHER; an empty `response`
+    /// gets nothing.
+    pub fn execute<U: Ui>(
+        &mut self,
+        command: Result<Command, StatusCode>,
+        ui: &mut U,
+        response: &mut [u8],
+    ) -> usize {
         let Some((status, body)) = response.split_first_mut() else {
             return 0;
         };
         let mut encoder = Encoder::new(body);
-        let outcome = match request.split_first() {
-            // A CTAPHID_CBOR message carries at least the command byte (§11.2.9.1.2).
-            None => Err(StatusCode::InvalidLength),
-            Some((&code, parameters)) => self.command(code, parameters, &mut encoder),
-        };
+        let outcome = command.and_then(|command| self.run(command, ui, &mut encoder));
         let written = encoder.len();
         match outcome {
             Ok(()) => {
@@ -297,35 +369,15 @@ impl Authenticator {
         }
     }
 
-    fn command(
+    fn run<U: Ui>(
         &mut self,
-        code: u8,
-        parameters: &[u8],
+        command: Command,
+        ui: &mut U,
         encoder: &mut Encoder<'_>,
     ) -> Result<(), StatusCode> {
-        match CommandCode::try_from(code) {
-            Ok(CommandCode::GetInfo) => {
-                // §6.4 defines no parameters.
-                if !parameters.is_empty() {
-                    return Err(StatusCode::InvalidLength);
-                }
-                self.get_info(encoder).map_err(|Full| StatusCode::Other)
-            }
-            // §8.1: a command code the authenticator does not implement is
-            // CTAP1_ERR_INVALID_COMMAND.
-            Ok(
-                CommandCode::MakeCredential
-                | CommandCode::GetAssertion
-                | CommandCode::ClientPin
-                | CommandCode::Reset
-                | CommandCode::GetNextAssertion
-                | CommandCode::BioEnrollment
-                | CommandCode::CredentialManagement
-                | CommandCode::Selection
-                | CommandCode::LargeBlobs
-                | CommandCode::Config,
-            )
-            | Err(UnknownCommand(_)) => Err(StatusCode::InvalidCommand),
+        match command {
+            Command::GetInfo => self.get_info(encoder).map_err(|Full| StatusCode::Other),
+            Command::Selection => selection(ui),
         }
     }
 
@@ -346,6 +398,18 @@ impl Authenticator {
             .unsigned(0x05)?
             .unsigned(u64::from(self.settings.max_msg_size.get()))?;
         Ok(())
+    }
+}
+
+/// authenticatorSelection (§6.9): user presence answers CTAP2_OK with no body, an explicit
+/// refusal CTAP2_ERR_OPERATION_DENIED, no answer CTAP2_ERR_USER_ACTION_TIMEOUT; a request the
+/// platform cancelled while it waited is CTAP2_ERR_KEEPALIVE_CANCEL (§11.2.9.1.5).
+fn selection<U: Ui>(ui: &mut U) -> Result<(), StatusCode> {
+    match ui.confirm(Prompt::Selection, USER_ACTION_TIMEOUT_MS) {
+        Answer::Confirmed => Ok(()),
+        Answer::Rejected => Err(StatusCode::OperationDenied),
+        Answer::Cancelled => Err(StatusCode::KeepaliveCancel),
+        Answer::TimedOut => Err(StatusCode::UserActionTimeout),
     }
 }
 

@@ -2,12 +2,13 @@
 # Runs the checks that need Ledger's Linux dev-tools image on the project's
 # Linux check host over SSH, without pushing anything.
 #
-#   STRUCTURED_PASSKEYS_LINUX=<ssh destination> scripts/linux/check.sh device|speculos
+#   STRUCTURED_PASSKEYS_LINUX=<ssh destination> scripts/linux/check.sh device|speculos|golden
 #
 # `device` builds and lints the device application for every target
 # (scripts/device-build.sh) and copies the artifacts back into
 # target/device/<target>/ of this checkout. `speculos` does the same, then runs
-# every build in Speculos (scripts/speculos-check.sh).
+# every build in Speculos (scripts/speculos-check.sh). `golden` runs Speculos
+# writing the screen snapshots and copies them into tests/snapshots/.
 #
 # The working tree is snapshotted as it is, uncommitted and untracked files
 # included (ignored files excluded), through a temporary index: HEAD, the index
@@ -25,9 +26,9 @@ destination="${STRUCTURED_PASSKEYS_LINUX:?set STRUCTURED_PASSKEYS_LINUX to the S
 action="${1:?action: device}"
 
 case "$action" in
-    device | speculos) ;;
+    device | speculos | golden) ;;
     *)
-        echo "unknown action $action: device, speculos" >&2
+        echo "unknown action $action: device, speculos, golden" >&2
         exit 2
         ;;
 esac
@@ -110,5 +111,17 @@ if ssh "${ssh_options[@]}" "$destination" "test -f $remote_dir/artifacts.tar && 
 else
     echo "no artifacts came back" >&2
     status=1
+fi
+if [[ "$action" == golden ]]; then
+    # shellcheck disable=SC2029 # the path is meant to be expanded here
+    if ssh "${ssh_options[@]}" "$destination" "test -f $remote_dir/snapshots.tar && cat $remote_dir/snapshots.tar" >"$work/snapshots.tar" &&
+        [[ -s "$work/snapshots.tar" ]]; then
+        mkdir -p "$root/tests"
+        tar -x -f "$work/snapshots.tar" -C "$root/tests"
+        echo "snapshots in $root/tests/snapshots"
+    else
+        echo "no snapshots came back" >&2
+        status=1
+    fi
 fi
 exit "$status"

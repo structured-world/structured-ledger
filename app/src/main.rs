@@ -5,10 +5,13 @@
 #![no_main]
 
 mod hid;
+mod ui;
 
 use ledger_device_sdk::include_gif;
 use ledger_device_sdk::io::{self, CommError, CommandOrEvent, DecodedEventType, StatusWords};
 use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
+use structured_passkeys_ctap::ctap2::Authenticator;
+use zeroize::Zeroize;
 
 ledger_device_sdk::set_panic!(ledger_device_sdk::exiting_panic);
 ledger_device_sdk::define_comm!(COMM);
@@ -33,11 +36,19 @@ const HOME_GLYPH: NbglGlyph = NbglGlyph::from_include(include_gif!("glyphs/key_6
 const HOME_GLYPH: NbglGlyph =
     NbglGlyph::from_include(include_gif!("glyphs/key_nano_14x14.png", NBGL));
 
+/// Largest CTAP response the application builds; getInfo needs a few dozen bytes.
+const RESPONSE_SIZE: usize = 1024;
+
+static RESPONSE: hid::Buffer<RESPONSE_SIZE> = hid::Buffer::new();
+
 #[unsafe(no_mangle)]
 extern "C" fn sample_main(_arg0: u32) {
     hid::start();
     let comm = io::init_comm(&COMM);
     comm.set_expected_cla(CLA);
+    let mut authenticator = Authenticator::new(hid::SETTINGS);
+    // SAFETY: `sample_main` runs once and is the only place that refers to the buffer.
+    let response = unsafe { &mut *RESPONSE.get() };
 
     // The home screen carries the version page and the quit action.
     let home = NbglHomeAndSettings::new().glyph(&HOME_GLYPH);
@@ -51,7 +62,8 @@ extern "C" fn sample_main(_arg0: u32) {
     home.show_and_return();
 
     // FIDO HID reports reach the transport through the USB class callbacks during each event;
-    // the loop only gives the transport its clock and answers the management channel.
+    // the loop gives the transport its clock, answers the management channel and runs the
+    // requests the transport hands out.
     loop {
         match comm.next_command_or_event() {
             CommandOrEvent::Command(command) => {
@@ -67,6 +79,14 @@ extern "C" fn sample_main(_arg0: u32) {
             }
             CommandOrEvent::Event(DecodedEventType::Ticker) => hid::tick(),
             CommandOrEvent::Event(_) => {}
+        }
+        // Parsed while the transport holds the request; run once it is released, so the screen
+        // of a waiting command can take events.
+        if let Some(command) = hid::take_request(|request| authenticator.parse(request)) {
+            let mut ui = ui::DeviceUi::new(comm, &mut home, &HOME_GLYPH);
+            let length = authenticator.execute(command, &mut ui, &mut response[..]);
+            hid::respond(&response[..length]);
+            response[..length].zeroize();
         }
     }
 }
