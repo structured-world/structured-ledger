@@ -32,13 +32,14 @@ impl MemoryStorage {
         }
     }
 
-    /// Lets `writes` more writes land and loses every one after them. Once power is lost, it
-    /// stays lost until [`MemoryStorage::power_on`], whatever later limit is set.
+    /// Lets `writes` more writes land and loses every one after them; an allowance past the
+    /// write counter's range never cuts power. Once power is lost, it stays lost until
+    /// [`MemoryStorage::power_on`], whatever later limit is set.
     pub fn lose_power_after(&mut self, writes: usize) {
         if self.power_until.is_some_and(|until| self.writes >= until) {
             return;
         }
-        self.power_until = Some(self.writes + writes);
+        self.power_until = self.writes.checked_add(writes);
     }
 
     /// Restores power: later writes land again.

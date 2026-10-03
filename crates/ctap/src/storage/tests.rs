@@ -656,6 +656,16 @@ fn power_stays_lost_until_power_on() {
     assert_eq!(storage.config(), &[1; super::CONFIG_LEN]);
 }
 
+/// An allowance past the write counter's range never cuts power, instead of overflowing.
+#[test]
+fn a_huge_power_allowance_keeps_power() {
+    let mut storage = MemoryStorage::new(1, 1);
+    storage.write_config(&[1; super::CONFIG_LEN]);
+    storage.lose_power_after(usize::MAX);
+    storage.write_config(&[2; super::CONFIG_LEN]);
+    assert_eq!(storage.config(), &[2; super::CONFIG_LEN]);
+}
+
 /// The double's and the store's debug output never print a record: key slots hold private keys
 /// and CredRandom, the configuration the PIN verifier.
 #[test]
