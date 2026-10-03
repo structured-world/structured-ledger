@@ -356,11 +356,16 @@ impl<S: Storage> Store<S> {
                 next_sequence: 0,
                 sequence_limit: 0,
             };
-            // Epoch 0: no earlier epoch survives here. Ledger OS replaces an application's NVM
-            // when it installs or updates the application, so a layout change only ever meets
-            // a fresh region, where the epoch of the previous install is already gone; earlier
-            // seed-recoverable credentials then open again until the encrypted backup, which
-            // carries the epoch, is restored, as the reset confirmation screen says.
+            // Epoch 0 by design, not a lost revocation. Ledger OS replaces an application's NVM
+            // when it installs or updates the application, so a format only ever meets a fresh
+            // region and no state of the previous install survives anywhere the application can
+            // write. A seed-recoverable credential is reproducible from the recovery phrase by
+            // definition (it reports backup eligible and backed up, BE=BS=1): the phrase is its
+            // backup, as a synced provider's account is for a synced passkey, and restoring the
+            // phrase onto fresh NVM brings it back. Reset therefore revokes such credentials for
+            // as long as this NVM lives; the reset epoch travels in the encrypted backup, whose
+            // import keeps the larger epoch, and the reset confirmation screen says both.
+            // Device-only credentials are unaffected: their keys are gone with the NVM.
             // No device key: the record of another layout holds none that this one could read.
             store.write_record(&Config::after_reset(0), None);
             return store;
