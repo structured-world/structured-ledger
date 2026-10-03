@@ -61,6 +61,9 @@ run_id="${CHECK_RUN_ID:-structured-passkeys-check-$(od -An -N8 -tx1 /dev/urandom
 remote_dir="/tmp/$run_id"
 # Marks the remote directory as this run's.
 owner=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+# The run directory is built here before it is renamed into place; the token
+# keeps it this run's alone.
+staging="$remote_dir.new.$owner"
 # Set while the remote directory may exist.
 remote_pending=0
 
@@ -99,7 +102,9 @@ remote() {
 upload() {
     local sum
     sum=$(cksum <"$1")
+    # Installed only into a directory that is still this run's.
     remote "part=$2.part.\$\$; cat > \$part && [ \"\$(cksum < \$part)\" = \"$sum\" ] &&
+        [ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ] &&
         mv -f \$part $2 || { rm -f \$part; exit 1; }" "$1"
 }
 
@@ -116,8 +121,8 @@ cleanup() {
     if [[ $remote_pending -eq 1 ]]; then
         # Only a directory this run owns goes; remote.sh runs with bash explicitly,
         # since the account's login shell may be any POSIX shell.
-        # The staging directory carries this run's name and holds nothing else.
-        if ! remote "rm -rf $remote_dir.new; if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" != $owner ]; then exit 0;
+        # The staging directory carries this run's token and holds nothing else.
+        if ! remote "rm -rf $staging; if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" != $owner ]; then exit 0;
             elif [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir;
             else find $remote_dir -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
                 rm -f $remote_dir/owner && rmdir $remote_dir; fi"; then
@@ -164,8 +169,8 @@ remote_pending=1
 # An attempt cut off on this side may still run on the host and rename first,
 # so a failed rename looks at the owner again.
 if ! remote "[ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ] || {
-    mkdir -p -m 700 $remote_dir.new && echo $owner > $remote_dir.new/owner &&
-    mv -T $remote_dir.new $remote_dir 2>/dev/null; } ||
+    mkdir -p -m 700 $staging && echo $owner > $staging/owner &&
+    mv -T $staging $remote_dir 2>/dev/null; } ||
     [ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ]"; then
     echo "$destination:$remote_dir exists already and is not this run's" >&2
     exit 1

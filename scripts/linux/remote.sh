@@ -92,16 +92,21 @@ case "$mode" in
         if run_running; then
             # The run leads its process group (setsid), which its docker clients are in.
             group=$(cat "$dir/pid")
-            # SIGTERM first, SIGKILL for what is left after thirty seconds; a run
+            # SIGTERM first, SIGKILL for what is left after the grace; a run
             # still running after both fails the stop, so its directory and
-            # containers are not removed from under it. The grace outlasts the
-            # cleanup of the run's own self-test (scripts/linux/check-test.sh),
-            # whose fake runs live in sessions of their own and need up to
-            # twenty seconds to be stopped by it.
+            # containers are not removed from under it. A run's own self-test
+            # (scripts/linux/check-test.sh) keeps fake runs in sessions of their
+            # own and stops them on SIGTERM with this same stop, so the stops it
+            # makes (CHECK_TEST_NESTED) get ten seconds and a real run's stop
+            # thirty, longer than such a nested stop with its escalation.
+            grace=30
+            if [[ -n "${CHECK_TEST_NESTED:-}" ]]; then
+                grace=10
+            fi
             for signal in TERM KILL; do
                 kill "-$signal" -- "-$group" 2>/dev/null
                 # Measured by the clock: a scan of a busy host takes time of its own.
-                deadline=$((SECONDS + 30))
+                deadline=$((SECONDS + grace))
                 while ((SECONDS < deadline)); do
                     run_running || break 2
                     sleep 0.2

@@ -299,8 +299,10 @@ empty="/tmp/structured-passkeys-check-test-empty-$$"
 mkdir -m 700 "$empty"
 FAKE_SSH_DROPS="" CHECK_RUN_ID=$(basename "$empty") start_check empty
 wait "$check" || fail "empty: the check failed on its own unmarked directory"
-[[ ! -e "$empty" && ! -e "$empty.new" ]] || fail "empty: $empty left on the host"
-rm -rf "$empty" "$empty.new"
+if [[ -e "$empty" ]] || compgen -G "$empty.new.*" >/dev/null; then
+    fail "empty: $empty left on the host"
+fi
+rm -rf "$empty" "$empty".new.*
 
 # A container that goes between listing and removal is no cleanup failure.
 FAKE_SSH_DROPS="" FAKE_DOCKER_RACE=1 start_check race
