@@ -1,9 +1,9 @@
 //! The NVM regions of [`Storage`] as statics in the application's `.nvm_data`, each record an SDK
 //! [`AtomicStorage`]: two copies with validity flags, so after a power loss a record holds the
 //! value before a write or the value written. An update writes the other copy and only
-//! invalidates the current one, whose bytes stay; records that hold secrets are therefore
-//! settled after every write and at start, so both copies hold the current value and no retired
-//! key or PIN verifier is left, also after a power loss between the two writes.
+//! invalidates the current one, whose bytes stay; every record is therefore settled after every
+//! write and at start, so both copies hold the current value and no retired key, PIN verifier,
+//! RP ID or credential ID is left, also after a power loss between the two writes.
 
 use ledger_device_sdk::NVMData;
 use ledger_device_sdk::nvm::{AtomicStorage, SingleStorage};
@@ -37,8 +37,8 @@ pub struct NvmStorage {
 impl NvmStorage {
     /// The regions, through the PIC-translated addresses of the statics. A record that was
     /// never written (Speculos loads `.nvm_data` zeroed, validity flags included) is written
-    /// as zeros, the free record, so every later read finds a valid copy. Records holding
-    /// secrets are settled, finishing an erase a power loss interrupted.
+    /// as zeros, the free record, so every later read finds a valid copy. Every record is
+    /// settled, finishing an erase a power loss interrupted.
     ///
     /// # Safety
     ///
@@ -59,6 +59,7 @@ impl NvmStorage {
         storage.config.settle();
         for record in storage.index.iter_mut() {
             record.get_or_init(&[0; INDEX_ENTRY_LEN]);
+            record.settle();
         }
         for record in storage.keys.iter_mut() {
             record.get_or_init(&[0; KEY_SLOT_LEN]);
@@ -88,7 +89,10 @@ impl Storage for NvmStorage {
     }
 
     fn write_index_entry(&mut self, slot: usize, record: &[u8; INDEX_ENTRY_LEN]) {
+        // RP ID and credential ID of a removed or reset entry: settling overwrites the copy the
+        // update retired.
         self.index[slot].update(record);
+        self.index[slot].settle();
     }
 
     fn key_slots(&self) -> usize {
