@@ -2,8 +2,11 @@
 //! asks, the platform shows its screen and answers; while it waits it keeps the transport going
 //! (keepalives, CANCEL) and gives up after the timeout it was given.
 
-/// How long a ceremony waits for the user (CTAP 2.2 §6.9 and every command asking for user
-/// presence): after this, the request ends with CTAP2_ERR_USER_ACTION_TIMEOUT.
+/// How long a ceremony waits for the user before the request ends with
+/// CTAP2_ERR_USER_ACTION_TIMEOUT. CTAP 2.2 ("User action timeout", Terminology) leaves the value
+/// to the authenticator, at least 10 seconds, and calls thirty seconds reasonable: long enough to
+/// read the screen, find the device and answer, short enough that a request nobody answers frees
+/// the device for the next one.
 pub const USER_ACTION_TIMEOUT_MS: u32 = 30_000;
 
 /// What the user is asked to confirm.

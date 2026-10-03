@@ -246,12 +246,11 @@ struct Hid {
     transport: Transport<MAX_MESSAGE_SIZE, &'static mut [u8; MAX_MESSAGE_SIZE]>,
     /// The transport handed out a request the main loop has not taken yet.
     pending: bool,
-    /// Counts the requests the transport handed out. Only equality is ever compared, so it
-    /// wraps.
-    requests: u32,
-    /// The request the main loop is running: its count in `requests` and its channel. A request
-    /// aborted meanwhile and a new one on the same channel would otherwise look the same.
-    running: Option<(u32, u32)>,
+    /// Channel of the request the main loop is running.
+    running: Option<u32>,
+    /// The transport handed out another request after the main loop took the running one: that
+    /// one was aborted, even if the new request came on the same channel.
+    superseded: bool,
     /// The host cancelled the request being run (CTAPHID_CANCEL on its channel).
     cancelled: bool,
     /// The stack's device handle, from the last callback that carried it; null before the
@@ -312,8 +311,8 @@ pub fn start() {
     let hid = Hid {
         transport: Transport::new(DEVICE_INFO, message),
         pending: false,
-        requests: 0,
         running: None,
+        superseded: false,
         cancelled: false,
         pdev: core::ptr::null_mut(),
         out_unarmed: false,
@@ -344,11 +343,13 @@ impl Hid {
         match event {
             Event::Request { .. } => {
                 self.pending = true;
-                self.requests = self.requests.wrapping_add(1);
+                // The transport hands out a request only once idle, so one running request is
+                // gone by now.
+                self.superseded = self.running.is_some();
             }
             // The transport reports CANCEL only for the request being processed (§11.2.9.1.5).
             Event::Cancel { cid } => {
-                if self.running.is_some_and(|(_, running)| running == cid) {
+                if self.running == Some(cid) {
                     self.cancelled = true;
                 }
             }
@@ -413,7 +414,8 @@ pub fn take_request<R>(parse: impl FnOnce(&[u8]) -> R) -> Option<R> {
         if !core::mem::take(&mut hid.pending) {
             return None;
         }
-        hid.running = hid.transport.active().map(|cid| (hid.requests, cid));
+        hid.running = hid.transport.active();
+        hid.superseded = false;
         hid.cancelled = false;
         hid.transport.request().map(parse)
     })
@@ -423,9 +425,7 @@ pub fn take_request<R>(parse: impl FnOnce(&[u8]) -> R) -> Option<R> {
 impl Hid {
     /// Whether the transport still processes the request the main loop is running.
     fn still_running(&self) -> bool {
-        self.running.is_some_and(|(count, cid)| {
-            count == self.requests && self.transport.active() == Some(cid)
-        })
+        !self.superseded && self.running.is_some() && self.transport.active() == self.running
     }
 }
 
