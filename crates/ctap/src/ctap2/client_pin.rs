@@ -1,0 +1,633 @@
+//! authenticatorClientPIN (CTAP 2.2 §6.5.5): parsing a request into what its execution needs,
+//! and the subcommands.
+
+use zeroize::{Zeroize, Zeroizing};
+
+use super::{Authenticator, StatusCode};
+use crate::cbor::{self, Decoder, Encoder, Full, Key};
+use crate::crypto::{Crypto, KEY_LEN, PUBLIC_KEY_LEN};
+use crate::pin::{
+    ClientPin, Features, MAX_CIPHERTEXT_LEN, Method, PADDED_PIN_LEN, PIN_HASH_LEN, Permissions,
+    Protocol, SharedSecret, TOKEN_LEN, new_pin,
+};
+use crate::storage::{MAX_RP_ID_LEN, PIN_RETRIES, PIN_VERIFIER_LEN, PinVerifier, Storage};
+use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui, Verification};
+
+/// The getInfo option IDs that decide token permissions. Credential management and
+/// authenticatorConfig are not implemented yet, so `credMgmt` and `authnrCfg` are absent and
+/// their permissions are refused.
+pub const FEATURES: Features = Features {
+    cred_mgmt: false,
+    authnr_cfg: false,
+    uv_acfg: false,
+    large_blobs: false,
+    per_cred_mgmt_ro: false,
+};
+
+/// authenticatorClientPIN subcommands (§6.5.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SubCommand {
+    /// getPINRetries.
+    GetPinRetries = 0x01,
+    /// getKeyAgreement.
+    GetKeyAgreement = 0x02,
+    /// setPIN.
+    SetPin = 0x03,
+    /// changePIN.
+    ChangePin = 0x04,
+    /// getPinToken.
+    GetPinToken = 0x05,
+    /// getPinUvAuthTokenUsingUvWithPermissions.
+    GetPinUvAuthTokenUsingUvWithPermissions = 0x06,
+    /// getUVRetries.
+    GetUvRetries = 0x07,
+    /// getPinUvAuthTokenUsingPinWithPermissions.
+    GetPinUvAuthTokenUsingPinWithPermissions = 0x09,
+}
+
+impl SubCommand {
+    const fn from_number(number: u64) -> Option<Self> {
+        Some(match number {
+            0x01 => SubCommand::GetPinRetries,
+            0x02 => SubCommand::GetKeyAgreement,
+            0x03 => SubCommand::SetPin,
+            0x04 => SubCommand::ChangePin,
+            0x05 => SubCommand::GetPinToken,
+            0x06 => SubCommand::GetPinUvAuthTokenUsingUvWithPermissions,
+            0x07 => SubCommand::GetUvRetries,
+            0x09 => SubCommand::GetPinUvAuthTokenUsingPinWithPermissions,
+            _ => return None,
+        })
+    }
+}
+
+/// A byte string member copied out of the request, up to `N` bytes. A longer one keeps no bytes
+/// and is only known to be too long: no member this command takes is longer than its buffer for
+/// a well-formed request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bytes<const N: usize> {
+    bytes: [u8; N],
+    /// The length, or `None` for a value longer than `N`.
+    len: Option<usize>,
+}
+
+impl<const N: usize> Bytes<N> {
+    fn new(value: &[u8]) -> Self {
+        let mut bytes = [0u8; N];
+        let len = bytes.get_mut(..value.len()).map(|target| {
+            target.copy_from_slice(value);
+            value.len()
+        });
+        Self { bytes, len }
+    }
+
+    /// The bytes, or `None` for a value that did not fit.
+    pub fn get(&self) -> Option<&[u8]> {
+        self.len.map(|len| &self.bytes[..len])
+    }
+}
+
+/// The platform key agreement key (`keyAgreement`, a COSE_Key, §6.5.6 `getPublicKey`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerKey {
+    /// The point, uncompressed SEC1, not yet checked to be on the curve.
+    Point([u8; PUBLIC_KEY_LEN]),
+    /// A key that is not an EC2 P-256 key with 32-byte coordinates: `decapsulate` fails on it.
+    Unusable,
+}
+
+/// The permissions RP ID (`rpId`): its hash for the token, and its display form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpId {
+    hash: [u8; KEY_LEN],
+    shown: [u8; MAX_RP_ID_LEN],
+    shown_len: usize,
+}
+
+impl RpId {
+    fn shown(&self) -> &str {
+        // The display form is cut at UTF-8 boundaries, so it is text.
+        core::str::from_utf8(&self.shown[..self.shown_len]).unwrap_or_default()
+    }
+}
+
+/// An authenticatorClientPIN request, owning its members.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientPinRequest {
+    protocol: Option<u64>,
+    sub_command: u64,
+    key_agreement: Option<PeerKey>,
+    pin_uv_auth_param: Option<Bytes<KEY_LEN>>,
+    new_pin_enc: Option<Bytes<MAX_CIPHERTEXT_LEN>>,
+    pin_hash_enc: Option<Bytes<KEY_LEN>>,
+    permissions: Option<u64>,
+    rp_id: Option<RpId>,
+}
+
+/// Parses the CBOR parameters of authenticatorClientPIN (§6.5.5). Unknown members are ignored
+/// (§8); `subCommand` is the one member every subcommand needs.
+pub(super) fn parse<C: Crypto>(
+    crypto: &C,
+    parameters: &[u8],
+) -> Result<ClientPinRequest, StatusCode> {
+    let mut decoder = Decoder::new(parameters);
+    let request = decoder.map(|entries| {
+        let mut request = ClientPinRequest {
+            protocol: None,
+            sub_command: 0,
+            key_agreement: None,
+            pin_uv_auth_param: None,
+            new_pin_enc: None,
+            pin_hash_enc: None,
+            permissions: None,
+            rp_id: None,
+        };
+        let mut sub_command = None;
+        while let Some(key) = entries.next_key()? {
+            let value = entries.value();
+            match key {
+                Key::Int(0x01) => request.protocol = Some(value.unsigned()?),
+                Key::Int(0x02) => sub_command = Some(value.unsigned()?),
+                Key::Int(0x03) => request.key_agreement = Some(peer_key(value)?),
+                Key::Int(0x04) => request.pin_uv_auth_param = Some(Bytes::new(value.bytes()?)),
+                Key::Int(0x05) => request.new_pin_enc = Some(Bytes::new(value.bytes()?)),
+                Key::Int(0x06) => request.pin_hash_enc = Some(Bytes::new(value.bytes()?)),
+                Key::Int(0x09) => request.permissions = Some(value.unsigned()?),
+                Key::Int(0x0A) => {
+                    let rp_id = value.text()?;
+                    let (shown, shown_len) = crate::storage::stored_rp_id(rp_id);
+                    request.rp_id = Some(RpId {
+                        hash: crypto.sha256(&[rp_id.as_bytes()]),
+                        shown,
+                        shown_len,
+                    });
+                }
+                _ => value.skip()?,
+            }
+        }
+        Ok((request, sub_command))
+    });
+    let (mut request, sub_command) = request.map_err(StatusCode::from)?;
+    decoder.finish().map_err(StatusCode::from)?;
+    request.sub_command = sub_command.ok_or(StatusCode::MissingParameter)?;
+    Ok(request)
+}
+
+/// Reads a COSE_Key (RFC 9052 §7) as the platform key agreement key: kty 2 (EC2), crv 1 (P-256),
+/// 32-byte x and y. `alg` is not checked: §6.5.6 sets it to -25 though that is not the algorithm
+/// used, so it carries nothing the key does not.
+fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
+    decoder.map(|entries| {
+        let mut kty = None;
+        let mut crv = None;
+        let mut x = None;
+        let mut y = None;
+        while let Some(key) = entries.next_key()? {
+            let value = entries.value();
+            match key {
+                Key::Int(1) => kty = Some(value.int()?),
+                Key::Int(-1) => crv = Some(value.int()?),
+                Key::Int(-2) => x = Some(value.bytes()?),
+                Key::Int(-3) => y = Some(value.bytes()?),
+                _ => value.skip()?,
+            }
+        }
+        let point = match (kty, crv, x, y) {
+            (Some(2), Some(1), Some(x), Some(y)) if x.len() == KEY_LEN && y.len() == KEY_LEN => {
+                let mut point = [0u8; PUBLIC_KEY_LEN];
+                point[0] = 0x04;
+                point[1..=KEY_LEN].copy_from_slice(x);
+                point[KEY_LEN + 1..].copy_from_slice(y);
+                PeerKey::Point(point)
+            }
+            _ => PeerKey::Unusable,
+        };
+        Ok(point)
+    })
+}
+
+/// Writes the key agreement public key as the COSE_Key of §6.5.6 `getPublicKey`: kty 2, alg
+/// -25, crv 1, x, y, keys in canonical order.
+fn write_cose_key(encoder: &mut Encoder<'_>, point: &[u8; PUBLIC_KEY_LEN]) -> Result<(), Full> {
+    encoder
+        .map(5)?
+        .unsigned(1)?
+        .unsigned(2)?
+        .unsigned(3)?
+        .int(-25)?
+        .int(-1)?
+        .unsigned(1)?
+        .int(-2)?
+        .bytes(&point[1..=KEY_LEN])?
+        .int(-3)?
+        .bytes(&point[KEY_LEN + 1..])?;
+    Ok(())
+}
+
+/// The members a subcommand requires, or CTAP2_ERR_MISSING_PARAMETER (§6.5.5.5 step 5.1 and its
+/// counterparts).
+fn required<T>(member: Option<T>) -> Result<T, StatusCode> {
+    member.ok_or(StatusCode::MissingParameter)
+}
+
+/// The selected protocol, or CTAP1_ERR_INVALID_PARAMETER for one not supported (§6.5.5.4 step 4).
+fn protocol(number: u64) -> Result<Protocol, StatusCode> {
+    Protocol::from_number(number).ok_or(StatusCode::InvalidParameter)
+}
+
+/// The shared secret with the platform key, or CTAP1_ERR_INVALID_PARAMETER when `decapsulate`
+/// fails (§6.5.5.5 step 5.4).
+fn decapsulate<C: Crypto>(
+    client_pin: &ClientPin,
+    crypto: &C,
+    protocol: Protocol,
+    peer: PeerKey,
+) -> Result<SharedSecret, StatusCode> {
+    match peer {
+        PeerKey::Point(point) => client_pin
+            .shared_secret(crypto, protocol, &point)
+            .map_err(|_| StatusCode::InvalidParameter),
+        PeerKey::Unusable => Err(StatusCode::InvalidParameter),
+    }
+}
+
+/// The answer to a consent screen: approval goes on, a refusal is CTAP2_ERR_OPERATION_DENIED
+/// (§6.5.5.7.2 step 7), and a timeout or cancellation ends the request as for any screen.
+fn consent(answer: Answer) -> Result<(), StatusCode> {
+    match answer {
+        Answer::Confirmed => Ok(()),
+        Answer::Rejected => Err(StatusCode::OperationDenied),
+        Answer::Cancelled => Err(StatusCode::KeepaliveCancel),
+        Answer::TimedOut => Err(StatusCode::UserActionTimeout),
+    }
+}
+
+impl<C: Crypto, S: Storage> Authenticator<C, S> {
+    /// Runs an authenticatorClientPIN request, writing its response map into `encoder`.
+    pub(super) fn client_pin<U: Ui>(
+        &mut self,
+        request: &ClientPinRequest,
+        ui: &mut U,
+        encoder: &mut Encoder<'_>,
+    ) -> Result<(), StatusCode> {
+        // §6.5.5: a subCommand the authenticator does not know is CTAP2_ERR_INVALID_SUBCOMMAND.
+        let sub_command =
+            SubCommand::from_number(request.sub_command).ok_or(StatusCode::InvalidSubcommand)?;
+        match sub_command {
+            SubCommand::GetPinRetries => self.get_pin_retries(encoder),
+            SubCommand::GetKeyAgreement => {
+                let protocol = protocol(required(request.protocol)?)?;
+                write_full(encoder.map(1).and_then(|encoder| encoder.unsigned(0x01)))?;
+                write_full(write_cose_key(
+                    encoder,
+                    self.client_pin.public_key(protocol),
+                ))
+            }
+            SubCommand::SetPin => self.set_pin(request),
+            SubCommand::ChangePin => self.change_pin(request),
+            SubCommand::GetPinToken => self.get_pin_token(request, ui, encoder),
+            SubCommand::GetPinUvAuthTokenUsingPinWithPermissions => {
+                self.get_pin_token(request, ui, encoder)
+            }
+            SubCommand::GetPinUvAuthTokenUsingUvWithPermissions => {
+                self.get_token_using_uv(request, ui, encoder)
+            }
+            SubCommand::GetUvRetries => {
+                let retries = self.uv_retries(ui);
+                write_full(
+                    encoder
+                        .map(1)
+                        .and_then(|encoder| encoder.unsigned(0x05))
+                        .and_then(|encoder| encoder.unsigned(u64::from(retries))),
+                )
+            }
+        }
+    }
+
+    /// getPINRetries (§6.5.5.2): `pinRetries` and `powerCycleState`.
+    fn get_pin_retries(&self, encoder: &mut Encoder<'_>) -> Result<(), StatusCode> {
+        let retries = self.store.config().pin_retries;
+        write_full(
+            encoder
+                .map(2)
+                .and_then(|encoder| encoder.unsigned(0x03))
+                .and_then(|encoder| encoder.unsigned(u64::from(retries)))
+                .and_then(|encoder| encoder.unsigned(0x04))
+                .and_then(|encoder| encoder.bool(self.client_pin.power_cycle_required())),
+        )
+    }
+
+    /// `uvRetries`: none once the client PIN is blocked, since a blocked PIN disables built-in
+    /// user verification too (§6.5.2.3, performBuiltInUv step 3); otherwise what the device
+    /// offers.
+    fn uv_retries<U: Ui>(&self, ui: &mut U) -> u8 {
+        let config = self.store.config();
+        if config.pin.is_some() && config.pin_retries == 0 {
+            return 0;
+        }
+        ui.uv_retries()
+    }
+
+    /// setPIN (§6.5.5.5).
+    fn set_pin(&mut self, request: &ClientPinRequest) -> Result<(), StatusCode> {
+        let number = required(request.protocol)?;
+        let peer = required(request.key_agreement)?;
+        let new_pin_enc = required(request.new_pin_enc)?;
+        let param = required(request.pin_uv_auth_param)?;
+        let protocol = protocol(number)?;
+        if self.store.config().pin.is_some() {
+            return Err(StatusCode::PinAuthInvalid);
+        }
+        let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
+        // A newPinEnc longer than a padded PIN's ciphertext cannot decrypt to 64 bytes.
+        let new_pin_enc = new_pin_enc.get().ok_or(StatusCode::InvalidParameter)?;
+        if !secret.verify(
+            &self.crypto,
+            &[new_pin_enc],
+            param.get().unwrap_or_default(),
+        ) {
+            return Err(StatusCode::PinAuthInvalid);
+        }
+        let verifier = self.new_pin_verifier(&secret, new_pin_enc)?;
+        let mut config = self.store.config();
+        config.pin = Some(verifier);
+        config.pin_retries = PIN_RETRIES;
+        self.store.write_config(&config);
+        Ok(())
+    }
+
+    /// changePIN (§6.5.5.6).
+    fn change_pin(&mut self, request: &ClientPinRequest) -> Result<(), StatusCode> {
+        let number = required(request.protocol)?;
+        let peer = required(request.key_agreement)?;
+        let pin_hash_enc = required(request.pin_hash_enc)?;
+        let new_pin_enc = required(request.new_pin_enc)?;
+        let param = required(request.pin_uv_auth_param)?;
+        let protocol = protocol(number)?;
+        self.pin_usable()?;
+        let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
+        // Either member longer than its buffer fails the MAC check below in a real exchange; it
+        // is refused as that check would refuse it.
+        let (Some(new_pin_enc), Some(pin_hash_enc)) = (new_pin_enc.get(), pin_hash_enc.get())
+        else {
+            return Err(StatusCode::PinAuthInvalid);
+        };
+        if !secret.verify(
+            &self.crypto,
+            &[new_pin_enc, pin_hash_enc],
+            param.get().unwrap_or_default(),
+        ) {
+            return Err(StatusCode::PinAuthInvalid);
+        }
+        self.check_pin_hash(&secret, pin_hash_enc)?;
+        let verifier = self.new_pin_verifier(&secret, new_pin_enc)?;
+        let mut config = self.store.config();
+        config.pin = Some(verifier);
+        config.pin_retries = PIN_RETRIES;
+        self.store.write_config(&config);
+        // Every token issued before stops working (step 5.19).
+        self.client_pin.reset_tokens(&mut self.crypto);
+        Ok(())
+    }
+
+    /// getPinToken (§6.5.5.7.1) and getPinUvAuthTokenUsingPinWithPermissions (§6.5.5.7.2).
+    fn get_pin_token<U: Ui>(
+        &mut self,
+        request: &ClientPinRequest,
+        ui: &mut U,
+        encoder: &mut Encoder<'_>,
+    ) -> Result<(), StatusCode> {
+        let with_permissions =
+            request.sub_command == SubCommand::GetPinUvAuthTokenUsingPinWithPermissions as u64;
+        let number = required(request.protocol)?;
+        let peer = required(request.key_agreement)?;
+        let pin_hash_enc = required(request.pin_hash_enc)?;
+        let permissions = if with_permissions {
+            Some(required(request.permissions)?)
+        } else {
+            None
+        };
+        let protocol = protocol(number)?;
+        let permissions = match permissions {
+            Some(bits) => {
+                if bits == 0 {
+                    return Err(StatusCode::InvalidParameter);
+                }
+                let permissions = Permissions::from_request(bits);
+                if FEATURES.unauthorized(permissions, Method::ClientPin) {
+                    return Err(StatusCode::UnauthorizedPermission);
+                }
+                permissions
+            }
+            // getPinToken takes neither permissions nor an RP ID (§6.5.5.7.1).
+            None => {
+                if request.permissions.is_some() || request.rp_id.is_some() {
+                    return Err(StatusCode::InvalidParameter);
+                }
+                Permissions::DEFAULT
+            }
+        };
+        self.pin_usable()?;
+        let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
+        consent(ui.confirm(
+            Prompt::Token {
+                permissions,
+                rp_id: request.rp_id.as_ref().map(RpId::shown),
+            },
+            USER_ACTION_TIMEOUT_MS,
+        ))?;
+        let pin_hash_enc = pin_hash_enc.get().unwrap_or_default();
+        self.check_pin_hash(&secret, pin_hash_enc)?;
+        // forcePINChange is never set: no command here lowers the minimum PIN length.
+        self.client_pin.reset_tokens(&mut self.crypto);
+        let now_ms = ui.now_ms();
+        self.client_pin.begin_using(
+            now_ms,
+            false,
+            permissions,
+            request.rp_id.map(|rp_id| rp_id.hash),
+        );
+        self.write_token(&secret, encoder)
+    }
+
+    /// getPinUvAuthTokenUsingUvWithPermissions (§6.5.5.7.3): the device PIN entered on the
+    /// device, checked by the operating system.
+    fn get_token_using_uv<U: Ui>(
+        &mut self,
+        request: &ClientPinRequest,
+        ui: &mut U,
+        encoder: &mut Encoder<'_>,
+    ) -> Result<(), StatusCode> {
+        let number = required(request.protocol)?;
+        let peer = required(request.key_agreement)?;
+        let bits = required(request.permissions)?;
+        let protocol = protocol(number)?;
+        if bits == 0 {
+            return Err(StatusCode::InvalidParameter);
+        }
+        let permissions = Permissions::from_request(bits);
+        if FEATURES.unauthorized(permissions, Method::BuiltInUv) {
+            return Err(StatusCode::UnauthorizedPermission);
+        }
+        if self.uv_retries(ui) == 0 {
+            return Err(StatusCode::UvBlocked);
+        }
+        // Checked before the keypad, so a request with an unusable key never asks for the PIN.
+        let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
+        let prompt = Prompt::Token {
+            permissions,
+            rp_id: request.rp_id.as_ref().map(RpId::shown),
+        };
+        match ui.verify_user(prompt, USER_ACTION_TIMEOUT_MS) {
+            Verification::Verified => {}
+            // Step 3.10: a failed verification is UV_BLOCKED once no attempt is left, which one
+            // wrong entry here always leaves, else UV_INVALID.
+            Verification::Invalid => {
+                return Err(if self.uv_retries(ui) == 0 {
+                    StatusCode::UvBlocked
+                } else {
+                    StatusCode::UvInvalid
+                });
+            }
+            Verification::Blocked => return Err(StatusCode::UvBlocked),
+            Verification::Rejected => return Err(StatusCode::OperationDenied),
+            Verification::Cancelled => return Err(StatusCode::KeepaliveCancel),
+            Verification::TimedOut => return Err(StatusCode::UserActionTimeout),
+        }
+        self.client_pin.reset_tokens(&mut self.crypto);
+        // Entering the PIN on the device is evidence of user interaction (step 3.13).
+        let now_ms = ui.now_ms();
+        self.client_pin.begin_using(
+            now_ms,
+            true,
+            permissions,
+            request.rp_id.map(|rp_id| rp_id.hash),
+        );
+        self.write_token(&secret, encoder)
+    }
+
+    /// The checks every PIN-entry subcommand makes before it spends a try: a PIN is set, it is
+    /// not blocked (CTAP2_ERR_PIN_BLOCKED, §6.5.5.6 step 5.3), and no three mismatches wait for
+    /// a power cycle (CTAP2_ERR_PIN_AUTH_BLOCKED, step 5.7.1.2.2).
+    fn pin_usable(&self) -> Result<(), StatusCode> {
+        let config = self.store.config();
+        if config.pin.is_none() {
+            // §6.5.5 lists no step for a PIN entry without a PIN; CTAP2_ERR_PIN_NOT_SET (§8.2)
+            // says what is wrong, and no try is spent on it.
+            return Err(StatusCode::PinNotSet);
+        }
+        if config.pin_retries == 0 {
+            return Err(StatusCode::PinBlocked);
+        }
+        if self.client_pin.power_cycle_required() {
+            return Err(StatusCode::PinAuthBlocked);
+        }
+        Ok(())
+    }
+
+    /// Spends a PIN try and checks `pinHashEnc` against the stored verifier (§6.5.5.6 steps
+    /// 5.6 to 5.8). The try is written before the comparison, so cutting power cannot save it.
+    /// A mismatch regenerates the key agreement key and answers CTAP2_ERR_PIN_BLOCKED,
+    /// CTAP2_ERR_PIN_AUTH_BLOCKED or CTAP2_ERR_PIN_INVALID; a match restores the tries.
+    fn check_pin_hash(
+        &mut self,
+        secret: &SharedSecret,
+        pin_hash_enc: &[u8],
+    ) -> Result<(), StatusCode> {
+        let mut config = self.store.config();
+        config.pin_retries = config
+            .pin_retries
+            .checked_sub(1)
+            .expect("pin_usable refuses a blocked PIN");
+        self.store.write_config(&config);
+        let mut pin_hash = Zeroizing::new([0u8; KEY_LEN]);
+        let matched = match secret.decrypt(&self.crypto, pin_hash_enc, &mut pin_hash[..]) {
+            Ok(PIN_HASH_LEN) => {
+                let mut candidate = [0u8; PIN_VERIFIER_LEN];
+                candidate.copy_from_slice(&pin_hash[..PIN_HASH_LEN]);
+                let matched = config
+                    .pin
+                    .as_ref()
+                    .is_some_and(|verifier| verifier.matches(&candidate));
+                candidate.zeroize();
+                matched
+            }
+            // A ciphertext of another length is a decrypt error or a wrong value: a mismatch.
+            Ok(_) | Err(_) => false,
+        };
+        if !matched {
+            self.client_pin
+                .regenerate(&mut self.crypto, secret.protocol());
+            if config.pin_retries == 0 {
+                return Err(StatusCode::PinBlocked);
+            }
+            return Err(if self.client_pin.mismatch() {
+                StatusCode::PinAuthBlocked
+            } else {
+                StatusCode::PinInvalid
+            });
+        }
+        self.client_pin.pin_matched();
+        config.pin_retries = PIN_RETRIES;
+        self.store.write_config(&config);
+        Ok(())
+    }
+
+    /// Decrypts `newPinEnc` and turns the PIN into its stored verifier `LEFT(SHA-256(newPin),
+    /// 16)` (§6.5.5.5 steps 5.6 to 5.12).
+    fn new_pin_verifier(
+        &self,
+        secret: &SharedSecret,
+        new_pin_enc: &[u8],
+    ) -> Result<PinVerifier, StatusCode> {
+        let mut padded = Zeroizing::new([0u8; PADDED_PIN_LEN]);
+        let length = secret
+            .decrypt(&self.crypto, new_pin_enc, &mut padded[..])
+            .map_err(|_| match new_pin_enc.len() {
+                // Too long to be a padded PIN at all: step 5.7's length error.
+                len if len > secret.protocol().ciphertext_len(PADDED_PIN_LEN) => {
+                    StatusCode::InvalidParameter
+                }
+                _ => StatusCode::PinAuthInvalid,
+            })?;
+        if length != PADDED_PIN_LEN {
+            return Err(StatusCode::InvalidParameter);
+        }
+        let pin = new_pin(&padded).ok_or(StatusCode::PinPolicyViolation)?;
+        let hash = Zeroizing::new(self.crypto.sha256(&[pin]));
+        let mut verifier = [0u8; PIN_VERIFIER_LEN];
+        verifier.copy_from_slice(&hash[..PIN_VERIFIER_LEN]);
+        let stored = PinVerifier::new(verifier);
+        verifier.zeroize();
+        Ok(stored)
+    }
+
+    /// The response of a token-issuing subcommand: `encrypt(sharedSecret, pinUvAuthToken)`.
+    fn write_token(
+        &mut self,
+        secret: &SharedSecret,
+        encoder: &mut Encoder<'_>,
+    ) -> Result<(), StatusCode> {
+        let mut encrypted = Zeroizing::new([0u8; MAX_CIPHERTEXT_LEN]);
+        // Borrowed in place: a copy of the token would stay on the stack.
+        let token: &[u8; TOKEN_LEN] = self.client_pin.token(secret.protocol());
+        let length = secret
+            .encrypt(&mut self.crypto, token, &mut encrypted[..])
+            .map_err(|_| StatusCode::Other)?;
+        write_full(
+            encoder
+                .map(1)
+                .and_then(|encoder| encoder.unsigned(0x02))
+                .and_then(|encoder| encoder.bytes(&encrypted[..length])),
+        )
+    }
+}
+
+/// A response that does not fit the buffer is CTAP1_ERR_OTHER.
+fn write_full<T>(result: Result<T, Full>) -> Result<(), StatusCode> {
+    result.map(|_| ()).map_err(|Full| StatusCode::Other)
+}
+
+#[cfg(test)]
+mod tests;

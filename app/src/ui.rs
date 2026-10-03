@@ -15,6 +15,7 @@ use ledger_device_sdk::sys::{
     BOLOS_TRUE, DEFAULT_PIN_RETRIES, nbgl_icon_details_t, nbgl_useCaseChoice, nbgl_useCaseKeypad,
     os_global_pin_check, os_global_pin_retries,
 };
+use structured_passkeys_ctap::pin::Permissions;
 use structured_passkeys_ctap::ui::{Answer, Prompt, Ui, Verification};
 use zeroize::Zeroize;
 
@@ -32,6 +33,53 @@ const PIN_ENTERED: u8 = 3;
 /// Longest device PIN: Ledger PINs have 4 to 8 digits.
 const PIN_MAX_DIGITS: u8 = 8;
 const PIN_MIN_DIGITS: u8 = 4;
+
+/// Room for a composed screen text: the longest consent sentence with a 64-byte RP ID.
+const TEXT_LEN: usize = 160;
+
+/// A NUL-terminated text composed for a screen. It lives in the frame of the call that shows the
+/// screen and waits for it, so it outlives the screen without taking RAM between screens, which
+/// the Nano X does not have to spare. Longer text is cut at a character boundary.
+struct Text([u8; TEXT_LEN]);
+
+impl Text {
+    /// The concatenation of `parts`.
+    fn new(parts: &[&str]) -> Self {
+        let mut bytes = [0u8; TEXT_LEN];
+        let mut length = 0;
+        'parts: for part in parts {
+            for character in part.chars() {
+                let width = character.len_utf8();
+                // One byte stays for the terminating NUL.
+                if length + width >= TEXT_LEN {
+                    break 'parts;
+                }
+                character.encode_utf8(&mut bytes[length..length + width]);
+                length += width;
+            }
+        }
+        Self(bytes)
+    }
+
+    /// The C string, valid while the text lives.
+    fn as_ptr(&self) -> *const c_char {
+        self.0.as_ptr().cast()
+    }
+}
+
+/// What a token with `permissions` lets the platform do, for the consent screen.
+fn purposes(permissions: Permissions) -> &'static str {
+    let sign_in = Permissions::MAKE_CREDENTIAL.bits() | Permissions::GET_ASSERTION.bits();
+    let manage = Permissions::CREDENTIAL_MANAGEMENT.bits();
+    let config = Permissions::AUTHENTICATOR_CONFIG.bits();
+    let bits = permissions.bits();
+    match (bits & sign_in != 0, bits & manage != 0, bits & config != 0) {
+        (true, false, false) => "sign in and create passkeys",
+        (false, true, false) => "list and delete your passkeys",
+        (false, false, true) => "change the security key's settings",
+        _ => "sign in, manage passkeys and change settings",
+    }
+}
 
 /// The digits entered on the keypad, from its callback until `os_global_pin_check` has read
 /// them; wiped right after, and before the keypad is shown.
@@ -162,28 +210,43 @@ impl<'a> DeviceUi<'a> {
 }
 
 impl Ui for DeviceUi<'_> {
-    fn confirm(&mut self, prompt: Prompt, timeout_ms: u32) -> Answer {
-        let (message, sub_message, confirm, reject): (&[u8], &[u8], &[u8], &[u8]) = match prompt {
+    fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer {
+        // Kept in this frame until the screen is gone.
+        let composed;
+        let (message, sub_message): (*const c_char, *const c_char) = match prompt {
             // authenticatorSelection carries no RP or user (CTAP 2.2 §6.9), so the screen says
             // why it names none.
             Prompt::Selection => (
-                b"Allow security key access?\0",
-                b"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.\0",
-                b"Allow\0",
-                b"Don't allow\0",
+                c"Allow security key access?".as_ptr(),
+                c"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.".as_ptr(),
             ),
+            // The platform asks for a pinUvAuthToken with the client PIN; the screen says what
+            // the token will allow and where (CTAP 2.2 §6.5.5.7.2 step 7).
+            Prompt::Token { permissions, rp_id } => {
+                composed = Text::new(&[
+                    "Your browser or system asks to ",
+                    purposes(permissions),
+                    match rp_id {
+                        Some(_) => " on ",
+                        None => " on any website",
+                    },
+                    rp_id.unwrap_or_default(),
+                    ".",
+                ]);
+                (c"Use your security key PIN?".as_ptr(), composed.as_ptr())
+            }
         };
         OUTCOME.store(PENDING, Ordering::Relaxed);
         let icon = self.icon();
-        // SAFETY: the strings are NUL-terminated statics and `icon` outlives the screen, which
-        // the wait below ends before this function returns.
+        // SAFETY: the strings are NUL-terminated, static or composed in this frame, and they and
+        // `icon` outlive the screen, which the wait below ends before this function returns.
         unsafe {
             nbgl_useCaseChoice(
                 &icon,
-                message.as_ptr().cast::<c_char>(),
-                sub_message.as_ptr().cast::<c_char>(),
-                confirm.as_ptr().cast::<c_char>(),
-                reject.as_ptr().cast::<c_char>(),
+                message,
+                sub_message,
+                c"Allow".as_ptr(),
+                c"Don't allow".as_ptr(),
                 Some(choice_callback),
             );
         }
@@ -195,21 +258,27 @@ impl Ui for DeviceUi<'_> {
         }
     }
 
-    fn verify_user(&mut self, timeout_ms: u32) -> Verification {
+    fn verify_user(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Verification {
         // The device's own count: three wrong entries wipe it. The keypad is offered only while
         // the count is full, so this application spends at most one try before a correct
         // entry, here or at unlock, restores it.
-        // SAFETY: a syscall without arguments.
-        if unsafe { os_global_pin_retries() } < DEFAULT_PIN_RETRIES {
+        if self.uv_retries() == 0 {
             return Verification::Blocked;
         }
+        // The keypad names what the PIN is for: entering it is the consent to the token.
+        let title = match prompt {
+            Prompt::Token {
+                rp_id: Some(rp_id), ..
+            } => Text::new(&["Device PIN to sign in to ", rp_id]),
+            Prompt::Token { .. } | Prompt::Selection => Text::new(&["Enter your device PIN"]),
+        };
         PIN.wipe();
         OUTCOME.store(PENDING, Ordering::Relaxed);
-        // SAFETY: the title is a NUL-terminated static; the callbacks only write the statics
-        // above, and the wait below ends the keypad before this function returns.
+        // SAFETY: the title is NUL-terminated and lives in this frame; the callbacks only write
+        // the statics above, and the wait below ends the keypad before this function returns.
         unsafe {
             nbgl_useCaseKeypad(
-                c"Enter your device PIN".as_ptr(),
+                title.as_ptr(),
                 PIN_MIN_DIGITS,
                 PIN_MAX_DIGITS,
                 true,
@@ -236,5 +305,15 @@ impl Ui for DeviceUi<'_> {
         };
         PIN.wipe();
         verification
+    }
+
+    fn uv_retries(&mut self) -> u8 {
+        // SAFETY: a syscall without arguments.
+        let retries = unsafe { os_global_pin_retries() };
+        u8::from(retries >= DEFAULT_PIN_RETRIES)
+    }
+
+    fn now_ms(&self) -> u64 {
+        hid::now_ms()
     }
 }

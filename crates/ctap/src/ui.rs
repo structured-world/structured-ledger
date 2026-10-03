@@ -2,6 +2,8 @@
 //! asks, the platform shows its screen and answers; while it waits it keeps the transport going
 //! (keepalives, CANCEL) and gives up after the timeout it was given.
 
+use crate::pin::Permissions;
+
 /// How long a ceremony waits for the user before the request ends with
 /// CTAP2_ERR_USER_ACTION_TIMEOUT. CTAP 2.2 ("User action timeout", Terminology) leaves the value
 /// to the authenticator, at least 10 seconds, and calls thirty seconds reasonable: long enough to
@@ -11,10 +13,19 @@ pub const USER_ACTION_TIMEOUT_MS: u32 = 30_000;
 
 /// What the user is asked to confirm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Prompt {
+pub enum Prompt<'a> {
     /// authenticatorSelection (§6.9): the platform asks which of the connected authenticators
     /// the user means.
     Selection,
+    /// A pinUvAuthToken with `permissions` (§6.5.5.7.1 to §6.5.5.7.3: an authenticator with a
+    /// display asks for consent to the permissions), for the RP `rp_id` when the request names
+    /// one. The RP ID is the form kept for display, at most 64 bytes.
+    Token {
+        /// The permissions the token would carry.
+        permissions: Permissions,
+        /// The permissions RP ID, if any.
+        rp_id: Option<&'a str>,
+    },
 }
 
 /// How a confirmation ended.
@@ -50,14 +61,23 @@ pub enum Verification {
     TimedOut,
 }
 
-/// The device's screens. Calls block until the user answers, the platform cancels, or the
-/// timeout passes.
+/// The device's screens and clock. Screen calls block until the user answers, the platform
+/// cancels, or the timeout passes.
 pub trait Ui {
     /// Asks the user to confirm `prompt` within `timeout_ms`.
-    fn confirm(&mut self, prompt: Prompt, timeout_ms: u32) -> Answer;
+    fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer;
 
-    /// Asks the user to enter the device PIN within `timeout_ms` and has the operating system
-    /// check it. Offered only while the operating system's retry count is full, so the
-    /// application spends at most one of the device's tries before a correct entry.
-    fn verify_user(&mut self, timeout_ms: u32) -> Verification;
+    /// Asks the user to enter the device PIN for `prompt` within `timeout_ms` and has the
+    /// operating system check it; the keypad states what the PIN is for, so entering it is the
+    /// consent to `prompt` and backing out the refusal. Offered only while
+    /// [`Ui::uv_retries`] is not zero.
+    fn verify_user(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Verification;
+
+    /// Built-in user verification attempts the device offers now (`uvRetries`, §6.5.2.3): one
+    /// while the operating system's retry count is full, none otherwise, so the application
+    /// spends at most one of the device's tries before a correct entry.
+    fn uv_retries(&mut self) -> u8;
+
+    /// The device's monotonic clock in milliseconds; it keeps running while a screen waits.
+    fn now_ms(&self) -> u64;
 }
