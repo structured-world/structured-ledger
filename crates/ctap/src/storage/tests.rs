@@ -220,7 +220,7 @@ fn entries_come_newest_first() {
 }
 
 /// A new credential for a user the RP already has replaces that entry in its slot (CTAP 2.2
-/// §6.1.2 step 16), even when the index is full; the same user at another RP is another
+/// §6.1.2 step 17.2), even when the index is full; the same user at another RP is another
 /// credential.
 #[test]
 fn the_same_user_is_replaced_even_when_full() {

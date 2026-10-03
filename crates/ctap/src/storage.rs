@@ -29,9 +29,12 @@ pub use memory::MemoryStorage;
 pub const LAYOUT_VERSION: u8 = 1;
 /// Longest RP ID kept in an index entry, in bytes.
 pub const MAX_RP_ID_LEN: usize = 64;
-/// Length of the stored PIN verifier, `LEFT(SHA-256(PIN), 16)` (CTAP 2.1 §6.5.5.5).
+/// Length of the stored PIN verifier, `LEFT(SHA-256(PIN), 16)` (CTAP 2.2 §6.5.5.5).
 pub const PIN_VERIFIER_LEN: usize = 16;
-/// PIN retries after a reset: CTAP 2.1 §6.5.2.2 sets the maximum `pinRetries` to 8.
+/// PIN retries after a reset: CTAP 2.2 §6.5.2.3 allows at most 8. The maximum is kept, since a
+/// guesser is already held to 8 attempts in all and to a power cycle after every three
+/// consecutive mismatches (§6.5.5.7.2), and a lower count only blocks the PIN of a user who
+/// mistyped.
 pub const PIN_RETRIES: u8 = 8;
 
 /// Marks a slot record in use; a free slot is all zeros.
@@ -123,7 +126,7 @@ pub enum StoreError {
 }
 
 impl From<StoreError> for StatusCode {
-    /// CTAP 2.2 §6.1.2 step 16: no room for a discoverable credential is
+    /// CTAP 2.2 §6.1.2 step 17.4: no room for a discoverable credential is
     /// CTAP2_ERR_KEY_STORE_FULL; the other refusals are internal and stay CTAP1_ERR_OTHER.
     fn from(error: StoreError) -> Self {
         match error {
@@ -167,7 +170,7 @@ impl fmt::Debug for PinVerifier {
 pub struct Config {
     /// Reset epoch: incremented by every reset and written into new credential IDs.
     pub epoch: u32,
-    /// `alwaysUv` (CTAP 2.1 §7.2).
+    /// `alwaysUv` (CTAP 2.2 §7.2).
     pub always_uv: bool,
     /// The client PIN, if one is set.
     pub pin: Option<PinVerifier>,
@@ -488,7 +491,8 @@ impl<S: Storage> Store<S> {
         (0..slot_count(self.storage.index_slots())).filter_map(|slot| self.entry(slot))
     }
 
-    /// The entries for `rp_id_hash`, most recently created first (CTAP 2.2 §6.2.2 step 11).
+    /// The entries for `rp_id_hash`, most recently created first, the order CTAP 2.2 §6.2.2 step
+    /// 12.2.1 sets for a request without an allowList.
     pub fn newest_first(&self, rp_id_hash: &[u8; KEY_LEN]) -> Vec<IndexEntry<'_>> {
         let mut entries: Vec<_> = self
             .entries()
