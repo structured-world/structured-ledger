@@ -6,8 +6,10 @@
 
 Run with `uv run crates/ctap/tests/vectors/derive.py`; the printed values are the expected bytes
 in crates/ctap/src/keys/tests.rs and crates/ctap/src/credential_id/tests.rs. With
-`--seeds <dir>` it also writes the two plaintexts and the two credential IDs into `<dir>` as seeds
-of the credential-id fuzz corpus.
+`--seeds <dir>` it also writes every plaintext and credential ID into `<dir>` as seeds of the
+credential-id fuzz corpus, each named by the SHA-1 of its bytes as cargo-fuzz names corpus
+entries, so writing into crates/ctap/fuzz/corpus/credential-id adds what is missing and
+duplicates nothing.
 """
 
 import hashlib
@@ -115,18 +117,18 @@ def main() -> None:
     print("device_credential_id", credential_id(device_plaintext, k_wrap).hex())
 
     if len(sys.argv) == 3 and sys.argv[1] == "--seeds":
-        seeds = {
-            "seed-plaintext": seed_plaintext,
-            "seed-credential-id": credential_id(seed_plaintext, k_wrap),
-            "slot-plaintext": slot_plaintext,
-            "slot-credential-id": credential_id(slot_plaintext, k_wrap),
-            "device-plaintext": device_plaintext,
-            "device-credential-id": credential_id(device_plaintext, k_wrap),
-        }
+        seeds = [
+            seed_plaintext,
+            credential_id(seed_plaintext, k_wrap),
+            slot_plaintext,
+            credential_id(slot_plaintext, k_wrap),
+            device_plaintext,
+            credential_id(device_plaintext, k_wrap),
+        ]
         directory = Path(sys.argv[2])
         directory.mkdir(parents=True, exist_ok=True)
-        for name, data in seeds.items():
-            (directory / name).write_bytes(data)
+        for data in seeds:
+            (directory / hashlib.sha1(data).hexdigest()).write_bytes(data)
 
 
 if __name__ == "__main__":
