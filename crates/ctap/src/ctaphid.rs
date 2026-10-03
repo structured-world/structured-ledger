@@ -366,9 +366,10 @@ pub struct Transport<const N: usize, S: BorrowMut<[u8; N]> = [u8; N]> {
     /// A taken report sits in the IN endpoint until the host reads it ([`Transport::sent`]); it
     /// cannot be taken back, so nothing else is offered meanwhile.
     in_flight: bool,
-    /// An error went out while a response was being sent: its next report goes before the next
-    /// error, so errors for other channels cannot starve it.
-    frame_owed: bool,
+    /// The last report taken was an error: the active channel's next report (a due keepalive or
+    /// the response's next report) goes before the next error, so errors for other channels
+    /// cannot starve it.
+    error_sent: bool,
     last_cid: u32,
     info: DeviceInfo,
     packet_timeout_ms: u64,
@@ -395,7 +396,7 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
             errors: ErrorQueue::new(),
             keepalive_pending: false,
             in_flight: false,
-            frame_owed: false,
+            error_sent: false,
             last_cid: 0,
             info,
             packet_timeout_ms: DEFAULT_PACKET_TIMEOUT_MS.get(),
@@ -470,7 +471,7 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
     fn reset(&mut self) {
         self.state = State::Idle;
         self.keepalive_pending = false;
-        self.frame_owed = false;
+        self.error_sent = false;
         self.wipe();
     }
 
@@ -618,7 +619,6 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
                     if let State::Sending { next, .. } = &mut self.state {
                         *next = None;
                     }
-                    self.frame_owed = false;
                     // Nothing more of the response is sent, so its bytes go now.
                     self.wipe();
                 } else {
@@ -630,19 +630,20 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
     }
 
     /// The report to send next and what taking it changes: nothing while a report is in the
-    /// endpoint; otherwise queued errors first, then a due keepalive, then the next report of the
-    /// response being sent, except that after an error that report goes before the next error.
-    /// An error for the channel whose response is being sent waits until that response is out,
-    /// so the channel's own message is never split by another initialization packet (§11.2.4).
+    /// endpoint; otherwise queued errors first, then the active channel's report (a due
+    /// keepalive or the next report of the response being sent), except that right after an
+    /// error the active channel's report goes first, so errors cannot starve it. An error for
+    /// the channel whose response is being sent waits until that response is out, so the
+    /// channel's own message is never split by another initialization packet (§11.2.4).
     fn plan(&self) -> Option<(Report, Step)> {
         if self.in_flight {
             return None;
         }
-        let frame = self.next_frame();
-        if self.frame_owed
-            && let Some(frame) = frame
+        let active = self.active_report();
+        if self.error_sent
+            && let Some(active) = active
         {
-            return Some(frame);
+            return Some(active);
         }
         let sending = match self.state {
             State::Sending { cid, .. } => Some(cid),
@@ -651,12 +652,18 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         if let Some((index, (cid, code))) = self.errors.first_except(sending) {
             return Some((error_report(cid, code), Step::Error(index)));
         }
+        active
+    }
+
+    /// The active channel's next report: a due keepalive for the request being processed, or
+    /// the next report of the response being sent.
+    fn active_report(&self) -> Option<(Report, Step)> {
         if let State::Processing { cid, status, .. } = self.state
             && self.keepalive_pending
         {
             return Some((keepalive_report(cid, status), Step::Keepalive));
         }
-        frame
+        self.next_frame()
     }
 
     /// The next report of the response being sent; `None` without one, or when its last report
@@ -693,14 +700,11 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
             return;
         };
         self.in_flight = true;
+        self.error_sent = matches!(step, Step::Error(_));
         match step {
-            Step::Error(index) => {
-                self.errors.remove(index);
-                self.frame_owed = self.next_frame().is_some();
-            }
+            Step::Error(index) => self.errors.remove(index),
             Step::Keepalive => self.keepalive_pending = false,
             Step::Frame(following) => {
-                self.frame_owed = false;
                 if let State::Sending {
                     next,
                     last_progress_ms,

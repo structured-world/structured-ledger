@@ -715,6 +715,31 @@ fn busy_errors_do_not_starve_the_response() {
     );
 }
 
+/// The same flood cannot starve the keepalives of a request being processed either: a due
+/// keepalive goes right after an error, so the active channel still hears from the device at
+/// least every 100 ms (§11.2.9.1.7).
+#[test]
+fn busy_errors_do_not_starve_keepalives() {
+    let mut transport = with_channels::<1024>(2);
+    cbor_request(&mut transport, 1, 0);
+    let mut reports = Vec::new();
+    for step in 1..=20u64 {
+        let now = step * 50;
+        transport.receive(&init_packet(2, 0x10, 1, &[0x04]), now);
+        transport.poll(now);
+        if let Some(report) = take(&mut transport, now) {
+            transport.sent();
+            reports.push(report);
+        }
+    }
+    let keepalives = messages(&reports)
+        .into_iter()
+        .filter(|message| *message == (1, 0x3B, vec![1]))
+        .count();
+    // One is due every 100 ms over the second the flood lasts.
+    assert!(keepalives >= 9, "{keepalives} keepalives in one second");
+}
+
 /// A report already handed to the IN endpoint cannot be taken back. When the host stops
 /// reading, the rest of the response is dropped, but the device stays busy (§11.2.5.1) until
 /// that report is read, so the stale report never precedes another transaction's answer.
