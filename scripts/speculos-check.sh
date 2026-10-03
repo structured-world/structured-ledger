@@ -25,7 +25,8 @@ if [[ -n "${CHECK_CONTAINER_PREFIX:-}" ]]; then
 fi
 
 docker pull --quiet "$image" >/dev/null
-docker run --rm "${name[@]}" \
+# The expansion stays nounset-safe for an empty array on Bash before 4.4.
+docker run --rm ${name[@]+"${name[@]}"} \
     --volume "$root:/app" \
     --workdir /app \
     --env SPECULOS_GOLDEN="${SPECULOS_GOLDEN:-0}" \

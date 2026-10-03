@@ -32,6 +32,12 @@ set -euo pipefail
 destination="${STRUCTURED_PASSKEYS_LINUX:?set STRUCTURED_PASSKEYS_LINUX to the SSH destination of the Linux check host}"
 action="${1:?action: device}"
 reconnect_seconds="${CHECK_RECONNECT_SECONDS:-1800}"
+# Decimal seconds up to a week: the value goes into arithmetic, where a leading
+# zero reads as octal and anything else is no number.
+if [[ ! "$reconnect_seconds" =~ ^(0|[1-9][0-9]{0,5})$ ]] || ((reconnect_seconds > 604800)); then
+    echo "CHECK_RECONNECT_SECONDS must be whole seconds from 0 to 604800" >&2
+    exit 2
+fi
 
 case "$action" in
     device | speculos | golden) ;;
@@ -54,8 +60,6 @@ run_id="structured-passkeys-check-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 remote_dir="/tmp/$run_id"
 # Set while the remote directory may exist.
 remote_pending=0
-# Set once the remote run has written its exit status.
-remote_done=0
 
 # Runs one idempotent command on the host, reconnecting after a dropped
 # connection until it ran or the connection stayed down for $reconnect_seconds;
@@ -84,9 +88,9 @@ remote() {
     done
 }
 
-# Removes the local snapshot and the remote directory, stopping the remote run
-# and its containers first when it has not finished; a failed remote removal
-# fails the run.
+# Removes the local snapshot and the remote directory, through `remote.sh stop`
+# once it is there, which first stops a run still alive and its containers; a
+# failed remote removal fails the run.
 # Older shellcheck releases report this as SC2317, newer ones as SC2329.
 # shellcheck disable=SC2317,SC2329 # called by the EXIT trap
 cleanup() {
@@ -95,13 +99,8 @@ cleanup() {
     git -C "$root" update-ref -d "$ref" 2>/dev/null || true
     rm -rf "$work"
     if [[ $remote_pending -eq 1 ]]; then
-        local stop=""
-        if [[ $remote_done -eq 0 ]]; then
-            # The run leads its own process group (setsid); its containers carry its name.
-            stop="if [ -f $remote_dir/pid ]; then kill -TERM -- -\$(cat $remote_dir/pid) 2>/dev/null; fi;"
-            stop+=" docker rm -f $run_id-build $run_id-speculos >/dev/null 2>&1;"
-        fi
-        if ! remote "$stop rm -rf $remote_dir"; then
+        # Run with bash explicitly: the account's login shell may be any POSIX shell.
+        if ! remote "if [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir; else rm -rf $remote_dir; fi"; then
             echo "remote directory $remote_dir could not be removed" >&2
             rc=1
         fi
@@ -142,11 +141,8 @@ remote "cat > $remote_dir/remote.sh" "$work/remote.sh"
 
 echo "snapshot ${commit:0:12} of $(git -C "$root" rev-parse --short HEAD) with local changes"
 echo "remote run in $destination:$remote_dir"
-# Started once: a retry after a dropped connection finds the marker and starts
-# nothing. setsid gives the run its own process group, nohup and the redirects
-# detach it from the SSH session.
-remote "mkdir $remote_dir/started 2>/dev/null || exit 0; cd $remote_dir &&
-    setsid nohup bash remote.sh $remote_dir $ref $action >run.log 2>&1 </dev/null &"
+launch="bash $remote_dir/remote.sh launch $remote_dir $ref $action"
+remote "$launch"
 
 # Shows the log from the byte already shown; returns non-zero when the host
 # stayed out of reach.
@@ -158,20 +154,39 @@ follow() {
     cat "$chunk"
     shown=$((shown + size))
 }
-# The status file appears after the last line of the log, so one more read
-# after it shows the rest.
+# The status appears after the last line of the log, so one more read after it
+# shows the rest. A run that is not there yet is launched again: the launch may
+# have been lost with its connection, and a second one exits at once when the
+# first runs. A run that ended without a status (killed on the host) fails the
+# check instead of being waited for.
 status=""
+starting_since=$SECONDS
 while :; do
-    if ! follow || ! remote "cat $remote_dir/status 2>/dev/null || true" "" "$work/status"; then
+    if ! follow || ! remote "bash $remote_dir/remote.sh state $remote_dir" "" "$work/state"; then
         echo "lost $destination; stopping the remote run" >&2
         exit 1
     fi
-    status=$(tr -d ' \n' <"$work/status")
-    if [[ -n "$status" ]]; then
-        remote_done=1
-        follow || true
-        break
-    fi
+    state=$(cat "$work/state")
+    case "$state" in
+        "done "*)
+            status=${state#done }
+            follow || true
+            break
+            ;;
+        running) ;;
+        starting)
+            if ((SECONDS - starting_since >= 120)); then
+                echo "the remote run did not start" >&2
+                exit 1
+            fi
+            remote "$launch"
+            ;;
+        *)
+            follow || true
+            echo "the remote run ended without a status ($state)" >&2
+            exit 1
+            ;;
+    esac
     sleep 5
 done
 
