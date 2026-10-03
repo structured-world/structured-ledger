@@ -150,10 +150,17 @@ case "$mode" in
         # left, so a stop retried after a dropped connection tries again instead
         # of finding nothing to clean.
         # The owner token goes last, so a removal cut off half way still marks
-        # the directory as this run's for the retry.
+        # the directory as this run's for the retry. A removal that fails on a
+        # directory already gone met a concurrent stop of the same run (a retry
+        # while this one still ran), which removed it: the host is clean. A
+        # directory still there with this token, or with none left, failed.
         if [[ $status -eq 0 ]] && owned; then
-            find "$dir" -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
-                rm -f "$dir/owner" && rmdir "$dir" || status=1
+            if ! { find "$dir" -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
+                rm -f "$dir/owner" && rmdir "$dir"; } 2>/dev/null &&
+                [[ -e "$dir" ]] && { owned || [[ ! -e "$dir/owner" ]]; }; then
+                echo "cannot remove $dir" >&2
+                status=1
+            fi
         fi
         exit "$status"
         ;;

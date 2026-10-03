@@ -23,6 +23,8 @@
 #     the cleanup, and a cleanup that cannot remove the containers keeps
 #     failing across a dropped connection;
 #   - a stop that carries another run's owner token touches nothing;
+#   - a stop that finds its run directory removed by a concurrent stop of the
+#     same run succeeds;
 #   - a process group whose only member is a zombie counts as stopped;
 #   - the checkout the test runs from keeps its artifacts: the checks run in a
 #     copy of the scripts.
@@ -139,7 +141,20 @@ case "$1" in
     *) exit 1 ;;
 esac
 EOF
-chmod +x "$tmp/bin/ssh" "$tmp/bin/docker"
+# find: with FAKE_FIND_HOLD (a directory) it marks itself held there and waits
+# for a release file before running, so a test can finish a second stop inside
+# a first one's removal; without it, the real find.
+cat >"$tmp/bin/find" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${FAKE_FIND_HOLD:-}" ]]; then
+    touch "$FAKE_FIND_HOLD/held"
+    until [[ -e "$FAKE_FIND_HOLD/release" ]]; do
+        sleep 0.1
+    done
+fi
+exec /usr/bin/find "$@"
+EOF
+chmod +x "$tmp/bin/ssh" "$tmp/bin/docker" "$tmp/bin/find"
 export PATH="$tmp/bin:$PATH"
 export STRUCTURED_PASSKEYS_LINUX=fake-host
 # The fake host is this machine, so its runs see this: they skip this test.
@@ -336,6 +351,29 @@ kill -0 "$stand_in" 2>/dev/null || fail "foreign: a stop with another token stop
 [[ -f "$foreign/owner" ]] || fail "foreign: a stop with another token removed the run directory"
 kill -KILL -- "-$stand_in" 2>/dev/null || true
 rm -rf "$foreign"
+
+# Two stops of one run, as a retry after a dropped connection leaves the first
+# still going: the one that finds the directory already removed by the other
+# succeeds, since the host is clean.
+twice="/tmp/structured-passkeys-check-test-twice-$$"
+mkdir -m 700 "$twice"
+cp "$repo/scripts/linux/remote.sh" "$twice/remote.sh"
+echo this-run >"$twice/owner"
+hold="$tmp/twice-hold"
+mkdir "$hold"
+FAKE_FIND_HOLD="$hold" bash "$twice/remote.sh" stop "$twice" this-run &
+first=$!
+if wait_for 10 test -e "$hold/held"; then
+    bash "$twice/remote.sh" stop "$twice" this-run || fail "twice: the second stop failed"
+    touch "$hold/release"
+    wait "$first" || fail "twice: a stop failed on a directory the other stop removed"
+    [[ ! -e "$twice" ]] || fail "twice: $twice left on the host"
+else
+    fail "twice: the first stop never reached the removal"
+    touch "$hold/release"
+    wait "$first" || true
+fi
+rm -rf "$twice"
 
 # A stopped check, its run ignoring SIGTERM.
 FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 FAKE_DOCKER_IGNORE_TERM=1 start_check stopped
