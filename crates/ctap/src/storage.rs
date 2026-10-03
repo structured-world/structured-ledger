@@ -367,7 +367,7 @@ impl<S: Storage> Store<S> {
             // import keeps the larger epoch, and the reset confirmation screen says both.
             // Device-only credentials are unaffected: their keys are gone with the NVM.
             // No device key: the record of another layout holds none that this one could read.
-            store.write_record(&Config::after_reset(0), None);
+            store.write_record(&Config::after_reset(0), 0, None);
             return store;
         }
         let mut store = Self {
@@ -403,10 +403,16 @@ impl<S: Storage> Store<S> {
         }
     }
 
-    /// Replaces the configuration in one write; the device key stays.
+    /// Replaces the configuration in one write; the device key stays, and so does the stored
+    /// epoch when `config` carries a smaller one. The epoch only grows: credential IDs issued
+    /// before a reset carry an older one, and a write from a stale `Config` must not let them
+    /// pass the epoch check again. A larger epoch is taken, as a backup import keeps the larger.
     pub fn write_config(&mut self, config: &Config) {
         let device_key = self.device_key();
-        self.write_record(config, device_key.as_deref());
+        let epoch = config
+            .epoch
+            .max(read_u32(self.storage.config(), CONFIG_EPOCH));
+        self.write_record(config, epoch, device_key.as_deref());
     }
 
     /// The device key `K_dev` of non-discoverable device-only credentials, if one was created
@@ -430,15 +436,17 @@ impl<S: Storage> Store<S> {
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         crypto.random(&mut key[..]);
         let config = self.config();
-        self.write_record(&config, Some(&key));
+        self.write_record(&config, config.epoch, Some(&key));
         key
     }
 
-    fn write_record(&mut self, config: &Config, device_key: Option<&[u8; KEY_LEN]>) {
+    /// Writes `config` with `epoch` in place of its own, so a caller can keep the stored epoch
+    /// without copying the rest of the configuration (it holds the PIN verifier).
+    fn write_record(&mut self, config: &Config, epoch: u32, device_key: Option<&[u8; KEY_LEN]>) {
         let mut record = Zeroizing::new([0u8; CONFIG_LEN]);
         record[CONFIG_VERSION] = LAYOUT_VERSION;
         write_u32(&mut record[..], CONFIG_GENERATION, self.generation);
-        write_u32(&mut record[..], CONFIG_EPOCH, config.epoch);
+        write_u32(&mut record[..], CONFIG_EPOCH, epoch);
         record[CONFIG_ALWAYS_UV] = u8::from(config.always_uv);
         record[CONFIG_PIN_RETRIES] = config.pin_retries;
         if let Some(pin) = &config.pin {
@@ -472,7 +480,7 @@ impl<S: Storage> Store<S> {
             .generation
             .checked_add(1)
             .ok_or(StoreError::Exhausted)?;
-        self.write_record(&Config::after_reset(epoch), None);
+        self.write_record(&Config::after_reset(epoch), epoch, None);
         self.sweep();
         Ok(())
     }

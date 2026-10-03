@@ -204,6 +204,27 @@ fn the_configuration_round_trips() {
     assert_eq!(format!("{pin:?}"), "PinVerifier(<redacted>)");
 }
 
+/// A configuration write built from a stale or constructed `Config` keeps the larger stored
+/// epoch: lowering it would let credential IDs issued before a reset pass the epoch check again.
+/// The rest of the configuration is written as given.
+#[test]
+fn a_configuration_write_never_lowers_the_epoch() {
+    let mut store = Store::open(MemoryStorage::new(1, 1));
+    store.write_config(&Config::after_reset(5));
+    store.write_config(&Config {
+        epoch: 2,
+        always_uv: true,
+        pin: Some(PinVerifier::new([0x42; 16])),
+        pin_retries: 4,
+    });
+    let store = Store::open(store.into_storage());
+    let config = store.config();
+    assert_eq!(config.epoch, 5);
+    assert!(config.always_uv);
+    assert_eq!(config.pin_retries, 4);
+    assert!(config.pin.expect("a PIN is set").matches(&[0x42; 16]));
+}
+
 /// Entries of an RP come back most recently created first (CTAP 2.2 §6.2.2), also after a
 /// reopen, which continues the creation sequence; another RP's entries are not among them.
 #[test]
