@@ -2,7 +2,8 @@
 //! [`AtomicStorage`]: two copies with validity flags, so after a power loss a record holds the
 //! value before a write or the value written. An update writes the other copy and only
 //! invalidates the current one, whose bytes stay; records that hold secrets are therefore
-//! written twice, so both copies hold the new value and no retired key or PIN verifier is left.
+//! settled after every write and at start, so both copies hold the current value and no retired
+//! key or PIN verifier is left, also after a power loss between the two writes.
 
 use ledger_device_sdk::NVMData;
 use ledger_device_sdk::nvm::{AtomicStorage, SingleStorage};
@@ -36,7 +37,8 @@ pub struct NvmStorage {
 impl NvmStorage {
     /// The regions, through the PIC-translated addresses of the statics. A record that was
     /// never written (Speculos loads `.nvm_data` zeroed, validity flags included) is written
-    /// as zeros, the free record, so every later read finds a valid copy.
+    /// as zeros, the free record, so every later read finds a valid copy. Records holding
+    /// secrets are settled, finishing an erase a power loss interrupted.
     ///
     /// # Safety
     ///
@@ -54,11 +56,13 @@ impl NvmStorage {
             }
         };
         storage.config.get_or_init(&[0; CONFIG_LEN]);
+        storage.config.settle();
         for record in storage.index.iter_mut() {
             record.get_or_init(&[0; INDEX_ENTRY_LEN]);
         }
         for record in storage.keys.iter_mut() {
             record.get_or_init(&[0; KEY_SLOT_LEN]);
+            record.settle();
         }
         storage
     }
@@ -70,9 +74,9 @@ impl Storage for NvmStorage {
     }
 
     fn write_config(&mut self, record: &[u8; CONFIG_LEN]) {
-        // The PIN verifier: the second update overwrites the copy the first one retired.
+        // The PIN verifier: settling overwrites the copy the update retired.
         self.config.update(record);
-        self.config.update(record);
+        self.config.settle();
     }
 
     fn index_slots(&self) -> usize {
@@ -96,8 +100,8 @@ impl Storage for NvmStorage {
     }
 
     fn write_key_slot(&mut self, slot: usize, record: &[u8; KEY_SLOT_LEN]) {
-        // Private key and CredRandom: the second update overwrites the copy the first retired.
+        // Private key and CredRandom: settling overwrites the copy the update retired.
         self.keys[slot].update(record);
-        self.keys[slot].update(record);
+        self.keys[slot].settle();
     }
 }
