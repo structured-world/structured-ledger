@@ -164,11 +164,13 @@ impl<'a> DeviceUi<'a> {
 impl Ui for DeviceUi<'_> {
     fn confirm(&mut self, prompt: Prompt, timeout_ms: u32) -> Answer {
         let (message, sub_message, confirm, reject): (&[u8], &[u8], &[u8], &[u8]) = match prompt {
+            // authenticatorSelection carries no RP or user (CTAP 2.2 §6.9), so the screen says
+            // why it names none.
             Prompt::Selection => (
-                b"Use this security key?\0",
-                b"A website or app asks which security key to use.\0",
-                b"Use this key\0",
-                b"Not this one\0",
+                b"Allow security key access?\0",
+                b"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.\0",
+                b"Allow\0",
+                b"Don't allow\0",
             ),
         };
         OUTCOME.store(PENDING, Ordering::Relaxed);

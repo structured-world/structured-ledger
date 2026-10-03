@@ -56,9 +56,9 @@ KEEPALIVE_SLACK_MS = 50
 USER_ACTION_TIMEOUT_S = 30
 TIMEOUT_SLACK_S = 5
 # The texts of the selection screen.
-SELECTION_TITLE = "Use this security key?"
-SELECTION_CONFIRM = "Use this key"
-SELECTION_REJECT = "Not this one"
+SELECTION_TITLE = "Allow security key access?"
+SELECTION_CONFIRM = "Allow"
+SELECTION_REJECT = "Don't allow"
 
 
 class KeepaliveLog:
@@ -171,6 +171,15 @@ def screen_shows(text: str) -> bool:
     return text in " ".join(joined.split())
 
 
+def button(text: str) -> dict | None:
+    """The text element of the current screen that reads exactly `text`: a button label, not a
+    title that happens to contain the same word."""
+    for event in screen_texts():
+        if event["text"].strip() == text:
+            return event
+    return None
+
+
 def wait_for_screen(text: str) -> None:
     for _ in range(100):
         if screen_shows(text):
@@ -191,17 +200,16 @@ class SpeculosUser:
             # The choice steps through its pages with the right button and takes the shown
             # one with both buttons.
             for _ in range(6):
-                if screen_shows(wanted):
+                if button(wanted) is not None:
                     api("/button/both", {"action": "press-and-release"})
                     return
                 api("/button/right", {"action": "press-and-release"})
                 time.sleep(0.2)
             raise SystemExit(f"FAILED: no page offers {wanted!r}")
-        for event in screen_texts():
-            if wanted in event["text"]:
-                api("/finger", {"action": "press-and-release", "x": event["x"], "y": event["y"]})
-                return
-        raise SystemExit(f"FAILED: no button reads {wanted!r}: {screen_texts()}")
+        event = button(wanted)
+        if event is None:
+            raise SystemExit(f"FAILED: no button reads {wanted!r}: {screen_texts()}")
+        api("/finger", {"action": "press-and-release", "x": event["x"], "y": event["y"]})
 
 
 class PersonAtDevice:

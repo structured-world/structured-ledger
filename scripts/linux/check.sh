@@ -64,6 +64,11 @@ cleanup() {
     exit "$rc"
 }
 trap cleanup EXIT
+# A stopped run cleans up too: the signal ends the script through `exit`, which runs the EXIT
+# trap, instead of killing it before the host is cleared.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # Snapshot through a temporary index so the real index is not touched.
 export GIT_INDEX_FILE="$work/index"
