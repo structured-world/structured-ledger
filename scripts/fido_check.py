@@ -15,7 +15,7 @@ echoes 1-byte and 7609-byte payloads (the largest CTAPHID message); getInfo pars
 CBOR checks and reports the application AAGUID and a 7609-byte maxMsgSize.
 
 authenticatorSelection (CTAP 2.2 §6.9), a request waiting for the user: while it waits, keepalives
-with status UPNEEDED arrive at least every 100 ms (§11.2.9.1.5); CTAPHID_CANCEL ends it with
+with status UPNEEDED arrive about every 100 ms (§11.2.9.1.7); CTAPHID_CANCEL ends it with
 CTAP2_ERR_KEEPALIVE_CANCEL; no answer ends it with CTAP2_ERR_USER_ACTION_TIMEOUT after 30 seconds;
 confirming answers CTAP2_OK and refusing CTAP2_ERR_OPERATION_DENIED. In Speculos the script
 answers the screen itself through the Speculos API and compares the selection screen with the
@@ -49,7 +49,9 @@ REPORT = 64
 # CTAPHID_KEEPALIVE (§11.2.9.2.1) and its status "user presence needed".
 KEEPALIVE = 0x80 | 0x3B
 STATUS_UPNEEDED = 2
-# §11.2.9.1.5: keepalives at least every 100 ms; the margin covers scheduling on the host.
+# §11.2.9.1.7: keepalives SHOULD go at least every 100 ms. The device sends one per OS tick,
+# which runs a few milliseconds slow on hardware; the margin covers that and scheduling on the
+# host.
 KEEPALIVE_GAP_MS = 100
 KEEPALIVE_SLACK_MS = 50
 # The user action timeout of the application, and how much later the error may arrive.

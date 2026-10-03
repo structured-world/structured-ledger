@@ -22,7 +22,10 @@ use structured_passkeys_ctap::ctaphid::{
 use zeroize::Zeroize;
 
 /// Interval of the OS ticker events the main loop forwards to [`tick`]; the transport clock
-/// advances by this much per tick.
+/// advances by this much per tick. The ticker is the device's only clock: keepalives, which
+/// CTAP 2.2 §11.2.9.1.7 says SHOULD go at least every 100 ms, follow it, and a device ticks a few
+/// milliseconds slow (up to 106 ms measured on the Nano Gen5). It cannot be set faster, since NBGL
+/// counts every tick as 100 ms for its own timers.
 pub const TICK_MS: u64 = 100;
 
 /// `USBD_StatusTypeDef` (`usbd_def.h`): one byte, as the SDK compiles C with `-fshort-enums`.
