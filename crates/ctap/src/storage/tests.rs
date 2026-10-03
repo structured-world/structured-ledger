@@ -43,7 +43,7 @@ fn add(
 ) -> Result<(EntryId, Option<KeySource>), StoreError> {
     let reservation = store.reserve(rp, "example.com", same_user(user))?;
     let source = match key {
-        Some(key) => match store.store_key(crypto, Some(&reservation), key) {
+        Some(key) => match store.store_key(crypto, &reservation, key) {
             Ok(source) => Some(source),
             Err(error) => {
                 store.release(reservation);
@@ -60,7 +60,7 @@ fn add(
 fn slot_key(source: &KeySource) -> (u16, [u8; SLOT_TAG_LEN]) {
     match source {
         KeySource::Slot { index, tag } => (*index, *tag),
-        KeySource::Seed(_) => panic!("a stored key is a slot"),
+        KeySource::Seed(_) | KeySource::Device(_) => panic!("a stored key is a slot"),
     }
 }
 
@@ -71,6 +71,7 @@ struct Snapshot {
     always_uv: bool,
     pin: Option<[u8; 16]>,
     pin_retries: u8,
+    device_key: Option<[u8; KEY_LEN]>,
     entries: Vec<(Vec<u8>, String, Vec<u8>)>,
     keys: Vec<(u16, [u8; KEY_LEN])>,
 }
@@ -93,6 +94,7 @@ fn snapshot(store: &Store<MemoryStorage>) -> Snapshot {
         always_uv: config.always_uv,
         pin: config.pin.as_ref().map(|pin| pin.0),
         pin_retries: config.pin_retries,
+        device_key: store.device_key().map(|key| *key),
         entries: entries
             .iter()
             .map(|entry| {
@@ -334,7 +336,7 @@ fn oversized_credential_ids_are_refused() {
             .reserve(&RP_A, "example.com", same_user("alice"))
             .expect("room");
         store
-            .store_key(&mut crypto, Some(&reservation), &device_key(1))
+            .store_key(&mut crypto, &reservation, &device_key(1))
             .expect("a free key slot");
         assert_eq!(store.commit(reservation, &id), Err(StoreError::TooLong));
         assert_eq!(store.remaining_discoverable(), 1);
@@ -353,7 +355,7 @@ fn a_device_key_opens_only_with_its_tag_and_entry() {
         .reserve(&RP_A, "example.com", same_user("alice"))
         .expect("room");
     let source = store
-        .store_key(&mut crypto, Some(&reservation), &device_key(0x31))
+        .store_key(&mut crypto, &reservation, &device_key(0x31))
         .expect("a free key slot");
     let (index, tag) = slot_key(&source);
     assert!(store.key(index, &tag).is_none(), "not before the entry");
@@ -370,21 +372,48 @@ fn a_device_key_opens_only_with_its_tag_and_entry() {
     assert!(store.key(u16::MAX, &tag).is_none());
 }
 
-/// A non-discoverable device-only key has no entry and opens as soon as it is stored.
+/// The device key of non-discoverable device-only credentials is drawn once, at the first such
+/// credential, and kept across reopens and configuration writes; it takes no key slot.
 #[test]
-fn a_key_without_an_entry_opens_at_once() {
+fn the_device_key_is_created_once_and_kept() {
     let mut crypto = crypto();
     let mut store = Store::open(MemoryStorage::new(1, 2));
-    let source = store
-        .store_key(&mut crypto, None, &device_key(0x55))
-        .expect("a free key slot");
-    let (index, tag) = slot_key(&source);
+    assert!(store.device_key().is_none(), "none before the first");
+    let created = store.device_key_or_create(&mut crypto);
+    assert_eq!(*store.device_key_or_create(&mut crypto), *created);
+    store.write_config(&Config {
+        pin: Some(PinVerifier::new([7; 16])),
+        ..store.config()
+    });
     let store = Store::open(store.into_storage());
-    assert_eq!(
-        store.key(index, &tag).map(|key| *key.private_key),
-        Some([0x55; KEY_LEN])
-    );
-    assert_eq!(store.remaining_keys(), 0);
+    assert_eq!(store.device_key().as_deref(), Some(&*created));
+    assert_eq!(store.remaining_keys(), 1, "no key slot taken");
+}
+
+/// Reset erases the device key with the rest of the configuration (CTAP 2.2 §6.6), so every
+/// non-discoverable device-only credential stops opening; the next one gets a new key.
+#[test]
+fn reset_erases_the_device_key() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::new(1, 2));
+    let before = store.device_key_or_create(&mut crypto);
+    store.reset().expect("an epoch left");
+    assert!(store.device_key().is_none());
+    let store_after = Store::open(store.into_storage());
+    assert!(store_after.device_key().is_none(), "also after a reopen");
+    let mut store = store_after;
+    assert_ne!(*store.device_key_or_create(&mut crypto), *before);
+}
+
+/// Formatting NVM of another layout keeps no device key from its bytes.
+#[test]
+fn another_layout_leaves_no_device_key() {
+    let mut storage = MemoryStorage::new(1, 1);
+    let mut config = [0xA5; super::CONFIG_LEN];
+    config[0] = LAYOUT_VERSION + 1;
+    storage.write_config(&config);
+    let store = Store::open(storage);
+    assert!(store.device_key().is_none());
 }
 
 /// A reused slot gets a new tag, so the ID of the credential that held it no longer opens it.
@@ -448,12 +477,7 @@ fn full_key_slots_are_refused() {
         0,
         "a device-only credential would not fit"
     );
-    assert_eq!(
-        store.store_key(&mut crypto, None, &device_key(3)),
-        Err(StoreError::Full),
-        "a non-discoverable key may not take the slot kept for replacements"
-    );
-    assert_eq!(store.remaining_keys(), 0);
+    assert_eq!(store.remaining_keys(), 0, "the free slot is the spare");
 }
 
 /// `remainingDiscoverableCredentials` is zero whenever a new discoverable credential may fail
@@ -464,13 +488,18 @@ fn remaining_discoverable_counts_key_slots_too() {
     let mut crypto = crypto();
     let mut store = Store::open(MemoryStorage::new(4, 3));
     assert_eq!(store.remaining_discoverable(), 2, "two keys and the spare");
-    store
-        .store_key(&mut crypto, None, &device_key(1))
-        .expect("a non-discoverable key");
-    store
-        .store_key(&mut crypto, None, &device_key(2))
-        .expect("a non-discoverable key");
-    assert_eq!(store.entries().count(), 0);
+    for (user, fill) in [("alice", 1), ("bob", 2)] {
+        add(
+            &mut store,
+            &mut crypto,
+            &RP_A,
+            user,
+            "1",
+            Some(&device_key(fill)),
+        )
+        .expect("room");
+    }
+    assert_eq!(store.entries().count(), 2, "two index slots still free");
     assert_eq!(store.remaining_discoverable(), 0);
 }
 
@@ -484,7 +513,7 @@ fn a_stale_release_keeps_a_newer_reservations_key() {
         .reserve(&RP_A, "example.com", same_user("alice"))
         .expect("room");
     store
-        .store_key(&mut crypto, Some(&stale), &device_key(1))
+        .store_key(&mut crypto, &stale, &device_key(1))
         .expect("a key slot");
     store.reset().expect("an epoch left");
     let fresh = store
@@ -492,7 +521,7 @@ fn a_stale_release_keeps_a_newer_reservations_key() {
         .expect("room");
     assert_eq!(fresh.id().slot, stale.id().slot);
     let source = store
-        .store_key(&mut crypto, Some(&fresh), &device_key(2))
+        .store_key(&mut crypto, &fresh, &device_key(2))
         .expect("a key slot");
     store.release(stale);
     store.commit(fresh, b"bob:1").expect("an ID within bounds");
@@ -629,15 +658,16 @@ fn a_released_reservation_changes_nothing() {
         .reserve(&RP_A, "example.com", same_user("alice"))
         .expect("replaces");
     store
-        .store_key(&mut crypto, Some(&reservation), &device_key(2))
+        .store_key(&mut crypto, &reservation, &device_key(2))
         .expect("a free key slot");
     store.release(reservation);
     assert_eq!(snapshot(&store), before);
     assert_no_residue(&store);
 }
 
-/// Reset empties the index and the key slots, clears the PIN and alwaysUv, restores the retries
-/// and increments the epoch; a reservation made before it is refused.
+/// Reset empties the index and the key slots, erases the device key, clears the PIN and
+/// alwaysUv, restores the retries and increments the epoch; a reservation made before it is
+/// refused.
 #[test]
 fn reset_empties_everything_and_raises_the_epoch() {
     let mut crypto = crypto();
@@ -657,13 +687,12 @@ fn reset_empties_everything_and_raises_the_epoch() {
         Some(&device_key(1)),
     )
     .expect("room");
-    store
-        .store_key(&mut crypto, None, &device_key(2))
-        .expect("room");
+    store.device_key_or_create(&mut crypto);
     let stale = store
         .reserve(&RP_B, "example.org", same_user("bob"))
         .expect("room");
     store.reset().expect("counters far from wrapping");
+    assert!(store.device_key().is_none());
     let config = store.config();
     assert_eq!(config.epoch, 4);
     assert!(!config.always_uv);
@@ -673,9 +702,7 @@ fn reset_empties_everything_and_raises_the_epoch() {
     assert_eq!(store.remaining_keys(), 2);
     assert_no_residue(&store);
     assert_eq!(
-        store
-            .store_key(&mut crypto, Some(&stale), &device_key(3))
-            .err(),
+        store.store_key(&mut crypto, &stale, &device_key(3)).err(),
         Some(StoreError::Stale)
     );
     assert_eq!(store.commit(stale, b"bob:1"), Err(StoreError::Stale));
@@ -749,7 +776,7 @@ fn a_huge_power_allowance_keeps_power() {
 }
 
 /// The double's and the store's debug output never print a record: key slots hold private keys
-/// and CredRandom, the configuration the PIN verifier.
+/// and CredRandom, the configuration the PIN verifier and the device key.
 #[test]
 fn debug_output_hides_the_records() {
     let mut crypto = crypto();
@@ -758,9 +785,16 @@ fn debug_output_hides_the_records() {
         pin: Some(PinVerifier::new([0x5A; 16])),
         ..Config::after_reset(0)
     });
-    store
-        .store_key(&mut crypto, None, &device_key(0x5A))
-        .expect("room");
+    store.device_key_or_create(&mut crypto);
+    add(
+        &mut store,
+        &mut crypto,
+        &RP_A,
+        "alice",
+        "1",
+        Some(&device_key(0x5A)),
+    )
+    .expect("room");
     let printed = format!("{store:?}");
     assert!(!printed.contains("90, 90"), "no record bytes: {printed}");
 }
@@ -798,8 +832,8 @@ fn power_loss_leaves_old_or_new(
     }
 }
 
-/// Two discoverable credentials of RP A (one device-only), one of RP B, a non-discoverable
-/// device-only key and a PIN.
+/// Two discoverable credentials of RP A (one device-only), one of RP B, the device key and a
+/// PIN.
 fn populated(crypto: &mut SoftCrypto) -> MemoryStorage {
     let mut store = Store::open(MemoryStorage::new(4, 4));
     store.write_config(&Config {
@@ -819,7 +853,7 @@ fn populated(crypto: &mut SoftCrypto) -> MemoryStorage {
     .expect("room");
     add(&mut store, crypto, &RP_A, "bob", "1", None).expect("room");
     add(&mut store, crypto, &RP_B, "carol", "1", None).expect("room");
-    store.store_key(crypto, None, &device_key(4)).expect("room");
+    store.device_key_or_create(crypto);
     store.into_storage()
 }
 

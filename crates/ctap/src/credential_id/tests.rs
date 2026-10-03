@@ -4,7 +4,7 @@
 
 use super::{
     CredProtect, Credential, KeySource, MAX_CREDENTIAL_ID_LEN, MAX_NAME_LEN, MAX_USER_ID_LEN,
-    OpenError, TooLong, User, VERSION, open, seal, truncate_on_char_boundary,
+    OpenError, SealError, User, VERSION, open, seal, truncate_on_char_boundary,
 };
 use crate::attestation::ES256;
 use crate::crypto::{Crypto, KEY_LEN, NONCE_LEN};
@@ -83,6 +83,30 @@ fn a_slot_credential_seals_to_the_reference_bytes() {
         )
     );
     assert_eq!(open(&crypto, &keys, RP, &id), Ok(slot_credential()));
+}
+
+/// A device-only, non-discoverable credential carries its credential seed for the derivation
+/// under K_dev: it seals to the reference bytes (derive.py: device_credential_id), which differ
+/// from the seed-recoverable one only in the origin, and opens back to itself.
+#[test]
+fn a_device_credential_seals_to_the_reference_bytes() {
+    let (mut crypto, keys) = platform();
+    let device = Credential {
+        key: KeySource::Device([0x33; 32]),
+        ..seed_credential()
+    };
+    let id = seal(&mut crypto, &keys, RP, &device).expect("fits");
+    assert_eq!(
+        id,
+        hex(
+            "01f91b337d83bdbe27156e7edd0eea9dc1e290a0b84b42e803235727ea616f039eb36e1e625c5561234e7f720b366b1e3f7d49235a57c950bcca19b75ca374959ffcaa13602260e20bc551"
+        )
+    );
+    assert_eq!(open(&crypto, &keys, RP, &id), Ok(device));
+    assert_eq!(
+        format!("{:?}", KeySource::Device([0x33; 32])),
+        "Device(<redacted>)"
+    );
 }
 
 /// The RP ID hash is bound as AAD: an ID created for one RP does not open for another, so a
@@ -203,11 +227,25 @@ fn authenticated_plaintexts_of_another_shape_are_refused() {
             &[0x06, 0x01, 0x07, 0xF4, 0x0B, 0x00],
         ]
         .concat(),
-        // Origin 0 (device-only) followed by a seed.
+        // An origin other than 0 and 1.
         around_seed(
-            &[0xA6, 0x01, 0x00, 0x02, 0x26, 0x03],
+            &[0xA6, 0x01, 0x02, 0x02, 0x26, 0x03],
             &[0x06, 0x01, 0x07, 0xF4, 0x0B, 0x00],
         ),
+        // A device-only seed under K_dev on a discoverable credential: {1: 0, 2: -7, 3: cs, 6: 1,
+        // 7: true, 8: h'01', 11: 0}.
+        around_seed(
+            &[0xA7, 0x01, 0x00, 0x02, 0x26, 0x03],
+            &[0x06, 0x01, 0x07, 0xF5, 0x08, 0x41, 0x01, 0x0B, 0x00],
+        ),
+        // A slot key on a non-discoverable credential: {1: 0, 2: -7, 4: 5, 5: tag, 6: 1, 7: false,
+        // 11: 0}.
+        [
+            &[0xA7, 0x01, 0x00, 0x02, 0x26, 0x04, 0x05, 0x05, 0x50][..],
+            &[0x44; 16],
+            &[0x06, 0x01, 0x07, 0xF4, 0x0B, 0x00],
+        ]
+        .concat(),
         // rk true without key 8.
         around_seed(
             &[0xA6, 0x01, 0x01, 0x02, 0x26, 0x03],
@@ -269,8 +307,30 @@ fn user_ids_outside_one_to_64_bytes_are_refused() {
         credential.user.as_mut().expect("user").id = vec![0x55; length];
         assert_eq!(
             seal(&mut crypto, &keys, RP, &credential),
-            Err(TooLong),
+            Err(SealError::TooLong),
             "{length}"
+        );
+    }
+}
+
+/// A slot key belongs to a discoverable credential, whose entry can delete it, and a key under
+/// K_dev to a non-discoverable one: the other pairings are refused when sealing.
+#[test]
+fn a_key_source_must_fit_the_discoverability() {
+    let (mut crypto, keys) = platform();
+    let discoverable_device = Credential {
+        key: KeySource::Device([0x33; 32]),
+        ..slot_credential()
+    };
+    let non_discoverable_slot = Credential {
+        user: None,
+        ..slot_credential()
+    };
+    for credential in [discoverable_device, non_discoverable_slot] {
+        assert_eq!(
+            seal(&mut crypto, &keys, RP, &credential),
+            Err(SealError::KeySource),
+            "{credential:?}"
         );
     }
 }

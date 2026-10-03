@@ -7,9 +7,11 @@
 //! - Every slot carries the generation of the configuration it was written under. A reset writes
 //!   a configuration with the next generation, which empties every slot in that one write; the
 //!   slots are wiped afterwards, and [`Store::open`] finishes a wipe that a power loss interrupted.
-//! - The device-only key of a discoverable credential names the index slot and creation sequence
-//!   of its entry. The key is written before the entry and counts only while that entry is in
-//!   the index, so replacing or removing the entry retires its key in the same write.
+//! - Every key slot names the index slot and creation sequence of the discoverable credential it
+//!   belongs to. The key is written before the entry and counts only while that entry is in the
+//!   index, so replacing or removing the entry retires its key in the same write. A
+//!   non-discoverable device-only credential takes no slot: its key derives from the device key
+//!   kept in the configuration ([`Store::device_key`]).
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -41,7 +43,7 @@ pub const PIN_RETRIES: u8 = 8;
 const USED: u8 = 1;
 
 // Configuration record: version, generation, epoch, alwaysUv, PIN retries, PIN set, verifier,
-// creation sequence limit.
+// creation sequence limit, device key set, device key.
 const CONFIG_VERSION: usize = 0;
 const CONFIG_GENERATION: usize = 1;
 const CONFIG_EPOCH: usize = 5;
@@ -50,8 +52,10 @@ const CONFIG_PIN_RETRIES: usize = 10;
 const CONFIG_PIN_SET: usize = 11;
 const CONFIG_PIN: usize = 12;
 const CONFIG_SEQUENCE_LIMIT: usize = CONFIG_PIN + PIN_VERIFIER_LEN;
+const CONFIG_DEVICE_KEY_SET: usize = CONFIG_SEQUENCE_LIMIT + 4;
+const CONFIG_DEVICE_KEY: usize = CONFIG_DEVICE_KEY_SET + 1;
 /// Length of the configuration record.
-pub const CONFIG_LEN: usize = CONFIG_SEQUENCE_LIMIT + 4;
+pub const CONFIG_LEN: usize = CONFIG_DEVICE_KEY + KEY_LEN;
 
 /// Creation sequences are handed out in blocks: the configuration records the end of the
 /// current block, so one configuration write covers this many creations and a sequence below
@@ -73,13 +77,12 @@ const ENTRY_CREDENTIAL_ID: usize = ENTRY_CREDENTIAL_ID_LEN + 2;
 /// Length of an index entry record.
 pub const INDEX_ENTRY_LEN: usize = ENTRY_CREDENTIAL_ID + MAX_CREDENTIAL_ID_LEN;
 
-// Key slot: state, generation, owner (flag, index slot, sequence), tag, key, two CredRandom.
+// Key slot: state, generation, owner (index slot, sequence), tag, key, two CredRandom.
 const KEY_STATE: usize = 0;
 const KEY_GENERATION: usize = 1;
-const KEY_OWNED: usize = 5;
-const KEY_OWNER_SLOT: usize = 6;
-const KEY_OWNER_SEQUENCE: usize = 8;
-const KEY_TAG: usize = 12;
+const KEY_OWNER_SLOT: usize = 5;
+const KEY_OWNER_SEQUENCE: usize = 7;
+const KEY_TAG: usize = 11;
 const KEY_PRIVATE: usize = KEY_TAG + SLOT_TAG_LEN;
 const KEY_CRED_RANDOM_UV: usize = KEY_PRIVATE + KEY_LEN;
 const KEY_CRED_RANDOM: usize = KEY_CRED_RANDOM_UV + KEY_LEN;
@@ -358,7 +361,8 @@ impl<S: Storage> Store<S> {
             // a fresh region, where the epoch of the previous install is already gone; earlier
             // seed-recoverable credentials then open again until the encrypted backup, which
             // carries the epoch, is restored, as the reset confirmation screen says.
-            store.write_config(&Config::after_reset(0));
+            // No device key: the record of another layout holds none that this one could read.
+            store.write_record(&Config::after_reset(0), None);
             return store;
         }
         let mut store = Self {
@@ -394,8 +398,38 @@ impl<S: Storage> Store<S> {
         }
     }
 
-    /// Replaces the configuration in one write.
+    /// Replaces the configuration in one write; the device key stays.
     pub fn write_config(&mut self, config: &Config) {
+        let device_key = self.device_key();
+        self.write_record(config, device_key.as_deref());
+    }
+
+    /// The device key `K_dev` of non-discoverable device-only credentials, if one was created
+    /// since the last reset; without it no such credential opens.
+    pub fn device_key(&self) -> Option<Zeroizing<[u8; KEY_LEN]>> {
+        let record = self.storage.config();
+        (record[CONFIG_DEVICE_KEY_SET] == USED).then(|| {
+            // Copied straight into the zeroizing buffer: no plain array holds it on the way.
+            let mut key = Zeroizing::new([0u8; KEY_LEN]);
+            key.copy_from_slice(&record[CONFIG_DEVICE_KEY..CONFIG_LEN]);
+            key
+        })
+    }
+
+    /// The device key, first drawn from the TRNG and written into the configuration if there is
+    /// none since the last reset.
+    pub fn device_key_or_create<C: Crypto>(&mut self, crypto: &mut C) -> Zeroizing<[u8; KEY_LEN]> {
+        if let Some(key) = self.device_key() {
+            return key;
+        }
+        let mut key = Zeroizing::new([0u8; KEY_LEN]);
+        crypto.random(&mut key[..]);
+        let config = self.config();
+        self.write_record(&config, Some(&key));
+        key
+    }
+
+    fn write_record(&mut self, config: &Config, device_key: Option<&[u8; KEY_LEN]>) {
         let mut record = Zeroizing::new([0u8; CONFIG_LEN]);
         record[CONFIG_VERSION] = LAYOUT_VERSION;
         write_u32(&mut record[..], CONFIG_GENERATION, self.generation);
@@ -407,14 +441,18 @@ impl<S: Storage> Store<S> {
             record[CONFIG_PIN..CONFIG_SEQUENCE_LIMIT].copy_from_slice(&pin.0);
         }
         write_u32(&mut record[..], CONFIG_SEQUENCE_LIMIT, self.sequence_limit);
+        if let Some(key) = device_key {
+            record[CONFIG_DEVICE_KEY_SET] = USED;
+            record[CONFIG_DEVICE_KEY..CONFIG_LEN].copy_from_slice(key);
+        }
         self.storage.write_config(&record);
     }
 
     /// authenticatorReset (CTAP 2.2 §6.6): empties the index and the key slots and writes the
-    /// configuration after a reset with the next epoch, all in one write, then wipes the slots.
-    /// §6.6 requires every credential to stop working and the PIN, `alwaysUv` and the
-    /// discoverable state to be cleared: device-only keys and entries are erased, and
-    /// seed-recoverable credential IDs of an earlier epoch are refused when opened.
+    /// configuration after a reset with the next epoch and no device key, all in one write, then
+    /// wipes the slots. §6.6 requires every credential to stop working and the PIN, `alwaysUv`
+    /// and the discoverable state to be cleared: device-only keys, the device key and entries are
+    /// erased, and seed-recoverable credential IDs of an earlier epoch are refused when opened.
     ///
     /// # Errors
     ///
@@ -429,7 +467,7 @@ impl<S: Storage> Store<S> {
             .generation
             .checked_add(1)
             .ok_or(StoreError::Exhausted)?;
-        self.write_config(&Config::after_reset(epoch));
+        self.write_record(&Config::after_reset(epoch), None);
         self.sweep();
         Ok(())
     }
@@ -566,9 +604,10 @@ impl<S: Storage> Store<S> {
         })
     }
 
-    /// Stores the secrets of a new device-only credential in a free key slot under a fresh tag.
-    /// `owner` is the reservation of a discoverable credential; the key counts only once that
-    /// reservation is committed. A non-discoverable credential has no owner.
+    /// Stores the secrets of a new discoverable device-only credential in a free key slot under a
+    /// fresh tag. The key belongs to `owner` and counts only once that reservation is committed.
+    /// A non-discoverable device-only credential takes no slot: its key derives from
+    /// [`Store::device_key_or_create`].
     ///
     /// The last free slot is kept for replacing a device-only credential (CTAP 2.2 §6.1.2 step
     /// 17.2): the old key holds its slot until the new entry is written, so such a replacement
@@ -581,17 +620,13 @@ impl<S: Storage> Store<S> {
     pub fn store_key<C: Crypto>(
         &mut self,
         crypto: &mut C,
-        owner: Option<&Reservation>,
+        owner: &Reservation,
         key: &DeviceKey,
     ) -> Result<KeySource, StoreError> {
-        if owner.is_some_and(|owner| owner.generation != self.generation) {
+        if owner.generation != self.generation {
             return Err(StoreError::Stale);
         }
-        let needed = if owner.is_some_and(|owner| owner.replaces_key) {
-            1
-        } else {
-            2
-        };
+        let needed = if owner.replaces_key { 1 } else { 2 };
         if self.free_keys() < needed {
             return Err(StoreError::Full);
         }
@@ -603,11 +638,8 @@ impl<S: Storage> Store<S> {
         let mut record = Zeroizing::new([0u8; KEY_SLOT_LEN]);
         record[KEY_STATE] = USED;
         write_u32(&mut record[..], KEY_GENERATION, self.generation);
-        if let Some(owner) = owner {
-            record[KEY_OWNED] = USED;
-            write_u16(&mut record[..], KEY_OWNER_SLOT, owner.id.slot);
-            write_u32(&mut record[..], KEY_OWNER_SEQUENCE, owner.id.sequence);
-        }
+        write_u16(&mut record[..], KEY_OWNER_SLOT, owner.id.slot);
+        write_u32(&mut record[..], KEY_OWNER_SEQUENCE, owner.id.sequence);
         record[KEY_TAG..KEY_PRIVATE].copy_from_slice(&tag);
         record[KEY_PRIVATE..KEY_CRED_RANDOM_UV].copy_from_slice(&key.private_key[..]);
         record[KEY_CRED_RANDOM_UV..KEY_CRED_RANDOM].copy_from_slice(&key.cred_random_uv[..]);
@@ -669,7 +701,6 @@ impl<S: Storage> Store<S> {
             let record = self.storage.key_slot(usize::from(key));
             let owned = record[KEY_STATE] == USED
                 && read_u32(record, KEY_GENERATION) == self.generation
-                && record[KEY_OWNED] == USED
                 && read_u16(record, KEY_OWNER_SLOT) == owner.slot
                 && read_u32(record, KEY_OWNER_SEQUENCE) == owner.sequence;
             if owned {
@@ -691,8 +722,8 @@ impl<S: Storage> Store<S> {
         true
     }
 
-    /// The secrets in key slot `index` if the slot still holds the key created with `tag` and,
-    /// for a discoverable credential, its entry is still in the index.
+    /// The secrets in key slot `index` if the slot still holds the key created with `tag` and its
+    /// entry is still in the index.
     pub fn key(&self, index: u16, tag: &[u8; SLOT_TAG_LEN]) -> Option<DeviceKey> {
         if index >= slot_count(self.storage.key_slots()) || !self.key_is_live(index) {
             return None;
@@ -718,7 +749,6 @@ impl<S: Storage> Store<S> {
         (0..slot_count(self.storage.key_slots())).any(|key| {
             let record = self.storage.key_slot(usize::from(key));
             self.key_is_live(key)
-                && record[KEY_OWNED] == USED
                 && read_u16(record, KEY_OWNER_SLOT) == id.slot
                 && read_u32(record, KEY_OWNER_SEQUENCE) == id.sequence
         })
@@ -731,15 +761,12 @@ impl<S: Storage> Store<S> {
         record[KEY_STATE] != USED || read_u32(record, KEY_GENERATION) != self.generation
     }
 
-    /// A key of this generation whose owner entry, if it has one, is in the index.
+    /// A key of this generation whose owner entry is in the index.
     fn key_is_live(&self, slot: u16) -> bool {
         if self.key_is_free(slot) {
             return false;
         }
         let record = self.storage.key_slot(usize::from(slot));
-        if record[KEY_OWNED] != USED {
-            return true;
-        }
         let owner = EntryId {
             slot: read_u16(record, KEY_OWNER_SLOT),
             sequence: read_u32(record, KEY_OWNER_SEQUENCE),
@@ -752,9 +779,7 @@ impl<S: Storage> Store<S> {
     fn wipe_orphans(&mut self, slot: u16) {
         for key in 0..slot_count(self.storage.key_slots()) {
             let record = self.storage.key_slot(usize::from(key));
-            let owned_here = record[KEY_STATE] == USED
-                && record[KEY_OWNED] == USED
-                && read_u16(record, KEY_OWNER_SLOT) == slot;
+            let owned_here = record[KEY_STATE] == USED && read_u16(record, KEY_OWNER_SLOT) == slot;
             if owned_here && !self.key_is_live(key) {
                 self.storage
                     .write_key_slot(usize::from(key), &[0; KEY_SLOT_LEN]);
