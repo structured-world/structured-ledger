@@ -935,6 +935,7 @@ version = "0.1.0"
 dependencies = [
  "ledger_device_sdk",
  "structured-passkeys-ctap",
+ "zeroize",
 ]
 
 [[package]]
