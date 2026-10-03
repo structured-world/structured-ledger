@@ -119,7 +119,8 @@ cleanup() {
         # The staging directory carries this run's name and holds nothing else.
         if ! remote "rm -rf $remote_dir.new; if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" != $owner ]; then exit 0;
             elif [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir;
-            else rm -rf $remote_dir; fi"; then
+            else find $remote_dir -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
+                rm -f $remote_dir/owner && rmdir $remote_dir; fi"; then
             echo "remote directory $remote_dir could not be removed" >&2
             rc=1
         fi

@@ -133,8 +133,11 @@ case "$mode" in
         # The directory (and its owner token) stays while a container may be
         # left, so a stop retried after a dropped connection tries again instead
         # of finding nothing to clean.
+        # The owner token goes last, so a removal cut off half way still marks
+        # the directory as this run's for the retry.
         if [[ $status -eq 0 ]]; then
-            rm -rf "$dir" || status=1
+            find "$dir" -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
+                rm -f "$dir/owner" && rmdir "$dir" || status=1
         fi
         exit "$status"
         ;;
