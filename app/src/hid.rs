@@ -246,8 +246,6 @@ struct Hid {
     /// The stack's device handle, from the last callback that carried it; null before the
     /// interface is configured.
     pdev: *mut c_void,
-    /// A report is in the IN endpoint and the host has not read it yet.
-    in_flight: bool,
     /// The OUT endpoint is not armed: the transport could not take a report yet
     /// ([`Transport::can_receive`]) or the stack refused to arm it. `pump` arms it again.
     out_unarmed: bool,
@@ -293,7 +291,6 @@ pub fn start() {
         authenticator: Authenticator::new(SETTINGS),
         response,
         pdev: core::ptr::null_mut(),
-        in_flight: false,
         out_unarmed: false,
         now_ms: 0,
     };
@@ -333,23 +330,23 @@ impl Hid {
         self.pump();
     }
 
-    /// Puts the next report into the IN endpoint if it is free, then arms the OUT endpoint if it
-    /// was left unarmed.
+    /// Puts the next report into the IN endpoint if it is free (the transport offers none while
+    /// the host has not read the last one), then arms the OUT endpoint if it was left unarmed.
     fn pump(&mut self) {
-        if !self.in_flight
-            && !self.pdev.is_null()
-            && let Some(report) = self.transport.next_report()
+        if !self.pdev.is_null()
+            && let Some(mut report) = self.transport.next_report()
         {
             // SAFETY: `pdev` is the handle the stack passed to the class; the stack copies the
             // report out before returning.
             let status = unsafe {
                 USBD_LL_Transmit(self.pdev, EP_IN, report.as_ptr(), REPORT_SIZE as u32, 0)
             };
+            // The copy here can carry request bytes (a PING echo); the stack has its own.
+            report.zeroize();
             // A refused report stays with the transport, which offers it again on the next
             // completion or tick, or whatever replaced it if its transaction was aborted.
             if status == USBD_OK {
                 self.transport.taken(self.now_ms);
-                self.in_flight = true;
             }
         }
         if self.out_unarmed {
@@ -375,7 +372,6 @@ impl Hid {
     /// Forgets the transaction and every queued report, wiping the buffer.
     fn reset(&mut self) {
         self.transport.restart();
-        self.in_flight = false;
         self.out_unarmed = false;
     }
 }
@@ -439,6 +435,9 @@ unsafe extern "C" fn setup(
     // Answers sent from statics: the stack may still read them after this call returns.
     static ZERO_STATUS: [u8; 2] = [0, 0];
     static ZERO: [u8; 1] = [0];
+    static ZERO_REPORT: [u8; REPORT_SIZE] = [0; REPORT_SIZE];
+    /// HID 1.11 §7.2.1: the report type in the high byte of wValue; 1 is Input.
+    const INPUT_REPORT: u8 = 1;
     let send = |data: &'static [u8]| {
         let length = data.len().min(usize::from(request.w_length));
         // SAFETY: `pdev` is the stack's handle and `data` lives for the whole program; the stack
@@ -461,6 +460,13 @@ unsafe extern "C" fn setup(
         // GET_INTERFACE: the only alternate setting is 0; SET_INTERFACE accepts only that one.
         (STANDARD_IN, 0x0A) => send(&ZERO),
         (STANDARD_OUT, 0x0B) if request.w_value == 0 => USBD_OK,
+        // GET_REPORT, mandatory for every HID device (HID 1.11 §7.2.1): the Input report of
+        // the descriptor, report ID 0. CTAPHID has no state to poll, so it reads as zeros;
+        // reports flow through the interrupt endpoints.
+        (CLASS_IN, 0x01) if request.w_value == u16::from(INPUT_REPORT) << 8 => send(&ZERO_REPORT),
+        // No SET_REPORT (0x09): with an interrupt OUT endpoint declared, Output reports go
+        // through it, not through the control pipe (HID 1.11 §4.4), so a second path for host
+        // data would serve no host.
         // HID class requests (HID 1.11 §7.2): no idle rate and no boot protocol to keep, so
         // GET_IDLE and GET_PROTOCOL report zero and the SET requests are accepted as no-ops.
         (CLASS_IN, 0x02 | 0x03) => send(&ZERO),
@@ -473,7 +479,6 @@ unsafe extern "C" fn setup(
 unsafe extern "C" fn data_in(pdev: *mut c_void, _cookie: *mut c_void, _ep: u8) -> UsbdStatus {
     with_hid(|hid| {
         hid.pdev = pdev;
-        hid.in_flight = false;
         hid.transport.sent();
         hid.pump();
     });
@@ -500,8 +505,11 @@ unsafe extern "C" fn data_out(
     let handled = with_hid(|hid| {
         hid.pdev = pdev;
         // Every report on this interface is 64 bytes (§11.2.4, the report descriptor above); a
-        // shorter or empty transfer is not a report and is dropped rather than padded into one.
-        if let Ok(report) = <&Report>::try_from(&*received) {
+        // transfer of any other length is not a report and is dropped, never padded or cut into
+        // one. `received` is bounded to 64 bytes for wiping, so the length is checked on its own.
+        if usize::from(length) == REPORT_SIZE
+            && let Ok(report) = <&Report>::try_from(&*received)
+        {
             let event = hid.transport.receive(report, hid.now_ms);
             hid.handle(event);
         }

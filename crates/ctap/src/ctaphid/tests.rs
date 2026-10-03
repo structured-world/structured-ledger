@@ -408,6 +408,7 @@ fn the_device_is_busy_until_the_response_is_sent() {
     );
     let first = take(&mut transport, 0).expect("the first report of the echo");
     assert_eq!(first[4], 0x81);
+    transport.sent();
     assert_eq!(
         transport.receive(&init_packet(2, 0x01, 0, &[]), 0),
         Event::None
@@ -452,7 +453,7 @@ fn a_report_is_consumed_only_once_taken() {
 
 /// The busy period ends when the host has read the last report of a response, not when the
 /// device handed it to the endpoint (§11.2.5.1): until `sent` acknowledges that completion,
-/// another channel is still busy.
+/// another channel is still busy, and nothing else is offered while the endpoint holds a report.
 #[test]
 fn the_device_is_busy_until_the_last_report_is_read() {
     let mut transport = with_channels::<1024>(2);
@@ -463,9 +464,13 @@ fn the_device_is_busy_until_the_last_report_is_read() {
         transport.receive(&init_packet(2, 0x01, 0, &[]), 0),
         Event::None
     );
-    let busy = take(&mut transport, 0).expect("the busy error");
-    assert_eq!(messages(&[busy]), vec![error(2, 0x06)], "echo not read yet");
+    assert_eq!(transport.next_report(), None, "the echo is in the endpoint");
     transport.sent();
+    assert_eq!(
+        sent(&mut transport, 0),
+        vec![error(2, 0x06)],
+        "busy while the echo was unread"
+    );
     assert_eq!(
         answer(&mut transport, &init_packet(2, 0x01, 0, &[]), 0),
         (2, 0x01, Vec::new()),
@@ -482,6 +487,7 @@ fn a_busy_error_does_not_split_the_channels_own_response() {
     transport.receive(&init_packet(1, 0x01, 116, &[9; 57]), 0);
     transport.receive(&cont_packet(1, 0, &[9; 59]), 0);
     let first = take(&mut transport, 0).expect("the first report of the echo");
+    transport.sent();
     transport.receive(&init_packet(1, 0x01, 0, &[]), 0);
     transport.receive(&init_packet(2, 0x01, 0, &[]), 0);
     let rest = drain(&mut transport, 0);
@@ -532,6 +538,9 @@ fn init_aborts_a_response_being_sent() {
         transport.receive(&init_packet(1, 0x06, 8, &NONCE), 0),
         Event::None
     );
+    // The report already in the endpoint is read before anything else goes.
+    assert_eq!(transport.next_report(), None);
+    transport.sent();
     let (cid, command, payload) = sent(&mut transport, 0).remove(0);
     assert_eq!(
         (cid, command, &payload[8..12]),
@@ -540,14 +549,15 @@ fn init_aborts_a_response_being_sent() {
     assert_eq!(transport.next_report(), None);
 }
 
-/// A response the host stops reading is dropped after the packet timeout, so the device does
-/// not stay busy for good; until then it is kept.
+/// A response whose next report the device's stack stops taking is dropped after the packet
+/// timeout, so the device does not stay busy for good; until then it is kept.
 #[test]
 fn a_response_the_host_stops_reading_is_dropped() {
     let mut transport = with_channels::<1024>(2);
     transport.receive(&init_packet(1, 0x01, 116, &[7; 57]), 0);
     transport.receive(&cont_packet(1, 0, &[7; 59]), 0);
     take(&mut transport, 100).expect("the first report of the echo");
+    transport.sent();
     let just_in_time = 100 + PACKET_TIMEOUT_MS - 1;
     transport.poll(just_in_time);
     assert_eq!(
@@ -556,6 +566,8 @@ fn a_response_the_host_stops_reading_is_dropped() {
     );
     let busy = take(&mut transport, just_in_time).expect("the busy error comes first");
     assert_eq!(messages(&[busy]), vec![error(2, 0x06)], "still sending");
+    transport.sent();
+    // The rest of the echo is never taken.
     transport.poll(100 + PACKET_TIMEOUT_MS);
     assert_eq!(transport.next_report(), None);
     assert_eq!(
@@ -662,19 +674,99 @@ fn cancel_reaches_only_the_active_request() {
     assert_eq!(transport.active(), Some(1), "the CTAP layer still answers");
 }
 
-/// CANCEL in the middle of a message on the same channel is never answered (§11.2.9.1.5); the
-/// client gave the message up, so it is dropped and its continuation becomes spurious.
+/// Sends a PING of `payload` on channel 1 of `transport`, packet by packet.
+fn ping_request<const N: usize>(transport: &mut Transport<N>, payload: &[u8], now: u64) {
+    let bcnt = u16::try_from(payload.len()).expect("a test payload fits BCNT");
+    let first = payload.len().min(57);
+    transport.receive(&init_packet(1, 0x01, bcnt, &payload[..first]), now);
+    for (seq, chunk) in payload[first..].chunks(59).enumerate() {
+        let seq = u8::try_from(seq).expect("a test payload fits the sequence numbers");
+        transport.receive(&cont_packet(1, seq, chunk), now);
+    }
+}
+
+/// A client that keeps sending requests on another channel while a response is out gets
+/// ERR_CHANNEL_BUSY each time (§11.2.5.1), but those errors cannot starve the response: after
+/// an error the next report is the response's own, so it completes while the errors keep
+/// flowing.
 #[test]
-fn cancel_during_assembly_is_silent_and_drops_the_message() {
+fn busy_errors_do_not_starve_the_response() {
+    let mut transport = with_channels::<1024>(2);
+    let payload: Vec<u8> = (0..1000u16).map(|i| (i % 251) as u8).collect();
+    ping_request(&mut transport, &payload, 0);
+    let mut reports = Vec::new();
+    for _ in 0..60 {
+        // Busy while the echo is out; once it is, one of these becomes the active request.
+        transport.receive(&init_packet(2, 0x10, 1, &[0x04]), 0);
+        if let Some(report) = take(&mut transport, 0) {
+            transport.sent();
+            reports.push(report);
+        }
+    }
+    // Read while the requests still come: 17 reports of echo among 60.
+    let received = messages(&reports);
+    assert!(
+        received.contains(&(1, 0x01, payload)),
+        "the PING echo arrived whole during the flood"
+    );
+    assert!(
+        received.contains(&error(2, 0x06)),
+        "the busy channel was told so"
+    );
+}
+
+/// A report already handed to the IN endpoint cannot be taken back. When the host stops
+/// reading, the rest of the response is dropped, but the device stays busy (§11.2.5.1) until
+/// that report is read, so the stale report never precedes another transaction's answer.
+#[test]
+fn a_report_in_the_endpoint_keeps_the_device_busy_past_the_timeout() {
+    let mut transport = with_channels::<1024>(2);
+    ping_request(&mut transport, &[7; 100], 0);
+    let first = take(&mut transport, 0).expect("the first report of the echo");
+    assert_eq!(first[..7], [0, 0, 0, 1, 0x81, 0, 100]);
+    assert_eq!(
+        transport.next_report(),
+        None,
+        "nothing else while the endpoint holds a report"
+    );
+    transport.poll(PACKET_TIMEOUT_MS);
+    assert_eq!(
+        transport.receive(&init_packet(2, 0x10, 1, &[0x04]), PACKET_TIMEOUT_MS),
+        Event::None,
+        "still busy"
+    );
+    transport.sent();
+    assert_eq!(
+        sent(&mut transport, PACKET_TIMEOUT_MS),
+        vec![error(2, 0x06)],
+        "the rest of the echo is dropped, the busy answer goes"
+    );
+    cbor_request(&mut transport, 2, PACKET_TIMEOUT_MS);
+}
+
+/// CANCEL acts only on a CBOR request being processed and is ignored otherwise (§11.2.9.1.5): in
+/// the middle of a message on the same channel it is not answered and leaves the message
+/// assembling, so the rest of the message still makes the request.
+#[test]
+fn cancel_during_assembly_is_ignored() {
     let mut transport = with_channels::<1024>(1);
     for report in [
         init_packet(1, 0x10, 100, &[0; 57]),
         init_packet(1, 0x11, 0, &[]),
-        cont_packet(1, 0, &[0; 43]),
     ] {
         assert_eq!(exchange(&mut transport, &report, 0), (Event::None, vec![]));
     }
-    assert_eq!(transport.active(), None);
+    assert_eq!(
+        exchange(&mut transport, &cont_packet(1, 0, &[0; 43]), 0),
+        (
+            Event::Request {
+                cid: 1,
+                command: Command::Cbor
+            },
+            vec![]
+        )
+    );
+    assert_eq!(transport.request().map(<[u8]>::len), Some(100));
 }
 
 /// INIT on the channel whose request is being processed aborts that transaction: the request is

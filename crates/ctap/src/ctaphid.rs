@@ -363,6 +363,12 @@ pub struct Transport<const N: usize, S: BorrowMut<[u8; N]> = [u8; N]> {
     errors: ErrorQueue,
     /// A keepalive for the request being processed waits for the endpoint.
     keepalive_pending: bool,
+    /// A taken report sits in the IN endpoint until the host reads it ([`Transport::sent`]); it
+    /// cannot be taken back, so nothing else is offered meanwhile.
+    in_flight: bool,
+    /// An error went out while a response was being sent: its next report goes before the next
+    /// error, so errors for other channels cannot starve it.
+    frame_owed: bool,
     last_cid: u32,
     info: DeviceInfo,
     packet_timeout_ms: u64,
@@ -388,6 +394,8 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
             state: State::Idle,
             errors: ErrorQueue::new(),
             keepalive_pending: false,
+            in_flight: false,
+            frame_owed: false,
             last_cid: 0,
             info,
             packet_timeout_ms: DEFAULT_PACKET_TIMEOUT_MS.get(),
@@ -438,6 +446,8 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         self.reset();
         self.errors = ErrorQueue::new();
         self.last_cid = 0;
+        // A bus reset empties the endpoints too.
+        self.in_flight = false;
     }
 
     /// Zeroes the message bytes held in the buffer: a request can carry PIN/UV material.
@@ -455,10 +465,12 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         self.buffer.borrow_mut()
     }
 
-    /// Ends the current transaction and wipes its data.
+    /// Ends the current transaction and wipes its data. A report already in the endpoint stays
+    /// there (`in_flight`): only the host reading it frees the endpoint.
     fn reset(&mut self) {
         self.state = State::Idle;
         self.keepalive_pending = false;
+        self.frame_owed = false;
         self.wipe();
     }
 
@@ -596,7 +608,20 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
             State::Sending {
                 last_progress_ms, ..
             } => {
-                if self.late(last_progress_ms, now_ms) {
+                if !self.late(last_progress_ms, now_ms) {
+                    return;
+                }
+                if self.in_flight {
+                    // The host stopped reading with a report still in the endpoint: the rest
+                    // of the response is dropped, and the device stays busy (§11.2.5.1) until
+                    // that report is read, so it never precedes another transaction's answer.
+                    if let State::Sending { next, .. } = &mut self.state {
+                        *next = None;
+                    }
+                    self.frame_owed = false;
+                    // Nothing more of the response is sent, so its bytes go now.
+                    self.wipe();
+                } else {
                     self.reset();
                 }
             }
@@ -604,11 +629,21 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         }
     }
 
-    /// The report to send next and what taking it changes: queued errors first, then a due
-    /// keepalive, then the next report of the response being sent. An error for the channel
-    /// whose response is being sent waits until that response is out, so the channel's own
-    /// message is never split by another initialization packet (§11.2.4).
+    /// The report to send next and what taking it changes: nothing while a report is in the
+    /// endpoint; otherwise queued errors first, then a due keepalive, then the next report of the
+    /// response being sent, except that after an error that report goes before the next error.
+    /// An error for the channel whose response is being sent waits until that response is out,
+    /// so the channel's own message is never split by another initialization packet (§11.2.4).
     fn plan(&self) -> Option<(Report, Step)> {
+        if self.in_flight {
+            return None;
+        }
+        let frame = self.next_frame();
+        if self.frame_owed
+            && let Some(frame) = frame
+        {
+            return Some(frame);
+        }
         let sending = match self.state {
             State::Sending { cid, .. } => Some(cid),
             _ => None,
@@ -621,6 +656,12 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         {
             return Some((keepalive_report(cid, status), Step::Keepalive));
         }
+        frame
+    }
+
+    /// The next report of the response being sent; `None` without one, or when its last report
+    /// waits for `sent`.
+    fn next_frame(&self) -> Option<(Report, Step)> {
         let State::Sending {
             cid,
             command,
@@ -629,7 +670,6 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
             ..
         } = self.state
         else {
-            // Nothing to send, or the last report waits for `sent`.
             return None;
         };
         // `len <= N` whenever a message is sent ([`Transport::respond`], `complete`).
@@ -652,10 +692,15 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         let Some((_, step)) = self.plan() else {
             return;
         };
+        self.in_flight = true;
         match step {
-            Step::Error(index) => self.errors.remove(index),
+            Step::Error(index) => {
+                self.errors.remove(index);
+                self.frame_owed = self.next_frame().is_some();
+            }
             Step::Keepalive => self.keepalive_pending = false,
             Step::Frame(following) => {
+                self.frame_owed = false;
                 if let State::Sending {
                     next,
                     last_progress_ms,
@@ -675,6 +720,7 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
     /// the last report of a response, the transaction ends and its data goes (§11.2.5.1: busy
     /// until the response is sent).
     pub fn sent(&mut self) {
+        self.in_flight = false;
         if let State::Sending { next: None, .. } = self.state {
             self.reset();
         }
@@ -791,13 +837,15 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
                 };
             }
             State::Assembling { cid: active, .. } if cid == active => {
-                // §11.2.5.3: INIT resynchronizes the channel; CANCEL gives the message up; any
-                // other initialization packet breaks the message being assembled.
+                // §11.2.9.1.5: CANCEL acts only on a CBOR request being processed and is ignored
+                // otherwise, so the message keeps assembling. §11.2.5.3: INIT resynchronizes the
+                // channel; any other initialization packet breaks the message being assembled.
+                if cancel {
+                    return Event::None;
+                }
                 self.reset();
-                match command {
-                    Ok(Command::Init) => {}
-                    Ok(Command::Cancel) => return Event::None,
-                    _ => return self.error(cid, ErrorCode::InvalidSeq),
+                if command != Ok(Command::Init) {
+                    return self.error(cid, ErrorCode::InvalidSeq);
                 }
             }
             State::Processing { .. } | State::Sending { .. } | State::Assembling { .. } => {
