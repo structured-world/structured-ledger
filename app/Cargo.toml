@@ -12,7 +12,9 @@ publish = false
 # `app_io_stack` runs the IO stack in the application, so the application can drive the FIDO HID
 # interface itself, and `Comm::next_command_or_event` hands it the ticker events its transport
 # clock needs; both come from this fork of the Ledger Rust SDK until the published crate has them.
-ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "77f7711b998d55967478ce846006e03029db2ce0", features = ["io_new", "nano_nbgl", "app_io_stack"] }
+# `sys` exposes the C SDK calls the application makes directly: the NBGL use cases its screens
+# start without the SDK's blocking wait, and the device PIN check.
+ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "77f7711b998d55967478ce846006e03029db2ce0", features = ["io_new", "nano_nbgl", "app_io_stack", "sys"] }
 structured-passkeys-ctap = { path = "../crates/ctap", default-features = false }
 zeroize = { version = "1.9.0", default-features = false }
 
@@ -21,7 +23,9 @@ zeroize = { version = "1.9.0", default-features = false }
 [package.metadata.ledger]
 name = "Structured Passkeys"
 curve = ["secp256r1"]
-flags = "0"
+# APPLICATION_FLAG_GLOBAL_PIN: built-in user verification has the operating system check the
+# device PIN the user re-enters in the ceremony.
+flags = "0x40"
 path = ["5722689'/5262163'"]
 nanosplus = { icon = "icons/key_14x14.png" }
 nanox = { icon = "icons/key_14x14.png" }

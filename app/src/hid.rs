@@ -6,19 +6,26 @@
 //! declares a plain HID interface with the FIDO report descriptor (CTAP 2.2 §11.2.8) and moves raw
 //! 64-byte reports between its endpoints and the core crate's [`Transport`], which owns the
 //! protocol: framing, channels, busy state, timeouts and keepalives.
+//!
+//! Requests are run by the main loop, not in the class callbacks: a command that waits for the
+//! user shows its screen and keeps taking events, which reach the class through the same
+//! callbacks, so the transport goes on answering (keepalives, CANCEL, other channels) meanwhile.
 
 use core::cell::{Cell, RefCell, UnsafeCell};
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
 
-use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings};
+use structured_passkeys_ctap::ctap2::{MaxMsgSize, Settings};
 use structured_passkeys_ctap::ctaphid::{
-    DeviceInfo, Event, MAX_MESSAGE_SIZE, REPORT_SIZE, Report, Transport,
+    DeviceInfo, Event, KeepaliveStatus, MAX_MESSAGE_SIZE, REPORT_SIZE, Report, Transport,
 };
 use zeroize::Zeroize;
 
 /// Interval of the OS ticker events the main loop forwards to [`tick`]; the transport clock
-/// advances by this much per tick.
+/// advances by this much per tick. The ticker is the device's only clock: keepalives, which
+/// CTAP 2.2 §11.2.9.1.7 says SHOULD go at least every 100 ms, follow it, and a device ticks a few
+/// milliseconds slow (up to 106 ms measured on the Nano Gen5). It cannot be set faster, since NBGL
+/// counts every tick as 100 ms for its own timers.
 pub const TICK_MS: u64 = 100;
 
 /// `USBD_StatusTypeDef` (`usbd_def.h`): one byte, as the SDK compiles C with `-fshort-enums`.
@@ -196,10 +203,6 @@ unsafe extern "C" {
     fn USBD_CtlSendData(pdev: *mut c_void, pbuf: *mut u8, len: u32) -> UsbdStatus;
 }
 
-/// Largest CTAP response the application builds; getInfo, the only command so far, needs a few
-/// dozen bytes.
-const RESPONSE_SIZE: usize = 1024;
-
 /// What INIT reports: the application version, CBOR only (U2F messages are not implemented).
 const DEVICE_INFO: DeviceInfo = DeviceInfo {
     version: [
@@ -231,7 +234,7 @@ const fn version_part(text: &str) -> u8 {
 const MESSAGE_SIZE: u16 = MAX_MESSAGE_SIZE as u16;
 
 /// The device settings getInfo reports.
-const SETTINGS: Settings = Settings {
+pub const SETTINGS: Settings = Settings {
     max_msg_size: match MaxMsgSize::new(MESSAGE_SIZE) {
         Ok(size) => size,
         Err(_) => panic!("the framing maximum is above the 1024-byte minimum"),
@@ -241,8 +244,15 @@ const SETTINGS: Settings = Settings {
 /// Everything the class keeps between callbacks.
 struct Hid {
     transport: Transport<MAX_MESSAGE_SIZE, &'static mut [u8; MAX_MESSAGE_SIZE]>,
-    authenticator: Authenticator,
-    response: &'static mut [u8; RESPONSE_SIZE],
+    /// The transport handed out a request the main loop has not taken yet.
+    pending: bool,
+    /// Channel of the request the main loop is running.
+    running: Option<u32>,
+    /// The transport handed out another request after the main loop took the running one: that
+    /// one was aborted, even if the new request came on the same channel.
+    superseded: bool,
+    /// The host cancelled the request being run (CTAPHID_CANCEL on its channel).
+    cancelled: bool,
     /// The stack's device handle, from the last callback that carried it; null before the
     /// interface is configured.
     pdev: *mut c_void,
@@ -255,13 +265,25 @@ struct Hid {
 
 /// A zero-initialized static buffer, handed out once as `&'static mut`. The device's linker
 /// script refuses initialized data in RAM, so everything large starts as zero bytes.
-struct Buffer<const N: usize>(UnsafeCell<[u8; N]>);
+pub struct Buffer<const N: usize>(UnsafeCell<[u8; N]>);
 
-// SAFETY: `start` hands each buffer out once, on the only thread.
+// SAFETY: each buffer is handed out once, on the only thread.
 unsafe impl<const N: usize> Sync for Buffer<N> {}
 
-static MESSAGE: Buffer<MAX_MESSAGE_SIZE> = Buffer(UnsafeCell::new([0; MAX_MESSAGE_SIZE]));
-static RESPONSE: Buffer<RESPONSE_SIZE> = Buffer(UnsafeCell::new([0; RESPONSE_SIZE]));
+impl<const N: usize> Buffer<N> {
+    /// A zeroed buffer.
+    pub const fn new() -> Self {
+        Self(UnsafeCell::new([0; N]))
+    }
+
+    /// The buffer's address; the one place that owns the buffer turns it into its only
+    /// reference.
+    pub const fn get(&self) -> *mut [u8; N] {
+        self.0.get()
+    }
+}
+
+static MESSAGE: Buffer<MAX_MESSAGE_SIZE> = Buffer::new();
 
 /// The class state, uninitialized until [`start`]. The application is single-threaded and the
 /// stack calls the class only from `os_io_rx_evt`, which nothing here calls while holding the
@@ -284,12 +306,14 @@ static HID: Global = Global {
 /// reach the class.
 pub fn start() {
     assert!(!HID.started.get(), "the FIDO HID class starts once");
-    // SAFETY: the guard above makes this the only time the buffers are borrowed.
-    let (message, response) = unsafe { (&mut *MESSAGE.0.get(), &mut *RESPONSE.0.get()) };
+    // SAFETY: the guard above makes this the only reference to the buffer.
+    let message = unsafe { &mut *MESSAGE.get() };
     let hid = Hid {
         transport: Transport::new(DEVICE_INFO, message),
-        authenticator: Authenticator::new(SETTINGS),
-        response,
+        pending: false,
+        running: None,
+        superseded: false,
+        cancelled: false,
         pdev: core::ptr::null_mut(),
         out_unarmed: false,
         now_ms: 0,
@@ -313,19 +337,23 @@ fn with_hid<R>(f: impl FnOnce(&mut Hid) -> R) -> Option<R> {
 }
 
 impl Hid {
-    /// Answers a request the transport handed out and sends what is due.
+    /// Notes a request for the main loop or a cancellation for the screen waiting on it, and
+    /// sends what is due.
     fn handle(&mut self, event: Event) {
         match event {
             Event::Request { .. } => {
-                if let Some(request) = self.transport.request() {
-                    let length = self.authenticator.process(request, &mut self.response[..]);
-                    self.transport
-                        .respond(&self.response[..length], self.now_ms)
-                        .expect("the response buffer is smaller than the transport's and the request is still active: nothing ran in between");
+                self.pending = true;
+                // The transport hands out a request only once idle, so one running request is
+                // gone by now.
+                self.superseded = self.running.is_some();
+            }
+            // The transport reports CANCEL only for the request being processed (§11.2.9.1.5).
+            Event::Cancel { cid } => {
+                if self.running == Some(cid) {
+                    self.cancelled = true;
                 }
             }
-            // Requests are answered as soon as they arrive, so there is no wait to cancel yet.
-            Event::Cancel { .. } | Event::None => {}
+            Event::None => {}
         }
         self.pump();
     }
@@ -372,8 +400,66 @@ impl Hid {
     /// Forgets the transaction and every queued report, wiping the buffer.
     fn reset(&mut self) {
         self.transport.restart();
+        self.pending = false;
+        // A request being run is gone with the transaction; its screen ends on its next check.
         self.out_unarmed = false;
     }
+}
+
+/// The request the transport handed out since the last call, given to `parse`; `None` when there
+/// is none. The request stays in the transport's buffer, which the main loop must not hold while
+/// it runs the command, so `parse` returns what the command needs.
+pub fn take_request<R>(parse: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    with_hid(|hid| {
+        if !core::mem::take(&mut hid.pending) {
+            return None;
+        }
+        hid.running = hid.transport.active();
+        hid.superseded = false;
+        hid.cancelled = false;
+        hid.transport.request().map(parse)
+    })
+    .flatten()
+}
+
+impl Hid {
+    /// Whether the transport still processes the request the main loop is running.
+    fn still_running(&self) -> bool {
+        !self.superseded && self.running.is_some() && self.transport.active() == self.running
+    }
+}
+
+/// Sends the response to the request being run. A request the host aborted meanwhile (INIT on
+/// its channel, a bus reset) has no one to answer, so the response is dropped rather than given
+/// to a request that took its place.
+pub fn respond(response: &[u8]) {
+    with_hid(|hid| {
+        // The response is at most the transport's size: both buffers have the same maximum.
+        if hid.still_running() && hid.transport.respond(response, hid.now_ms).is_ok() {
+            hid.pump();
+        }
+        hid.running = None;
+    });
+}
+
+/// Switches the keepalives of the request being run to "user presence needed" (§11.2.9.1.7) or
+/// back to "processing".
+pub fn waiting_for_user(waiting: bool) {
+    with_hid(|hid| {
+        if hid.still_running() {
+            hid.transport.set_status(if waiting {
+                KeepaliveStatus::UpNeeded
+            } else {
+                KeepaliveStatus::Processing
+            });
+            hid.pump();
+        }
+    });
+}
+
+/// Whether the request being run is gone: cancelled by the host, or aborted with its channel.
+pub fn request_ended() -> bool {
+    with_hid(|hid| hid.cancelled || !hid.still_running()).unwrap_or(true)
 }
 
 /// Advances the transport clock by one ticker interval: times out stalled messages, schedules

@@ -2,9 +2,11 @@
 //! written out byte by byte, never produced by the code under test.
 
 use super::{
-    AAGUID, Authenticator, CommandCode, MaxMsgSize, Settings, StatusCode, TooSmall, UnknownCommand,
+    AAGUID, Authenticator, Command, CommandCode, MaxMsgSize, Settings, StatusCode, TooSmall,
+    UnknownCommand,
 };
 use crate::cbor::{self, validate};
+use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui, Verification};
 
 fn settings() -> Settings {
     Settings {
@@ -12,11 +14,88 @@ fn settings() -> Settings {
     }
 }
 
-fn process(request: &[u8]) -> Vec<u8> {
+/// A user who gives `answer` to every confirmation, recording what was asked.
+struct Scripted {
+    answer: Answer,
+    asked: Vec<(Prompt, u32)>,
+}
+
+impl Scripted {
+    fn new(answer: Answer) -> Self {
+        Self {
+            answer,
+            asked: Vec::new(),
+        }
+    }
+}
+
+impl Ui for Scripted {
+    fn confirm(&mut self, prompt: Prompt, timeout_ms: u32) -> Answer {
+        self.asked.push((prompt, timeout_ms));
+        self.answer
+    }
+
+    fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
+        panic!("no command here asks for user verification")
+    }
+}
+
+fn process_with(request: &[u8], ui: &mut Scripted) -> Vec<u8> {
     let mut authenticator = Authenticator::new(settings());
     let mut response = [0u8; 256];
-    let length = authenticator.process(request, &mut response);
+    let length = authenticator.process(request, ui, &mut response);
     response[..length].to_vec()
+}
+
+/// Processes `request` for a user who would confirm, checking that no screen was shown.
+fn process(request: &[u8]) -> Vec<u8> {
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let response = process_with(request, &mut ui);
+    assert_eq!(ui.asked, [], "no screen for {request:02x?}");
+    response
+}
+
+/// authenticatorSelection asks for user presence once, with the 30-second user action timeout,
+/// and answers as §6.9 says: presence CTAP2_OK with no body, refusal OPERATION_DENIED, no answer
+/// USER_ACTION_TIMEOUT; a request cancelled while it waited is KEEPALIVE_CANCEL (§11.2.9.1.5).
+#[test]
+fn selection_answers_with_the_users_answer() {
+    for (answer, status) in [
+        (Answer::Confirmed, 0x00),
+        (Answer::Rejected, 0x27),
+        (Answer::TimedOut, 0x2F),
+        (Answer::Cancelled, 0x2D),
+    ] {
+        let mut ui = Scripted::new(answer);
+        assert_eq!(process_with(&[0x0B], &mut ui), [status], "{answer:?}");
+        assert_eq!(
+            ui.asked,
+            [(Prompt::Selection, USER_ACTION_TIMEOUT_MS)],
+            "{answer:?}"
+        );
+    }
+    assert_eq!(USER_ACTION_TIMEOUT_MS, 30_000);
+}
+
+/// authenticatorSelection has no parameters: bytes after the command are an invalid length, and
+/// no screen is shown for it.
+#[test]
+fn selection_with_parameters_is_invalid_length() {
+    assert_eq!(process(&[0x0B, 0xA0]), [StatusCode::InvalidLength as u8]);
+}
+
+/// Parsing names the command without running it, so a request can be parsed while the transport
+/// holds it and run once the transport is free again.
+#[test]
+fn parsing_names_the_command() {
+    let authenticator = Authenticator::new(settings());
+    assert_eq!(authenticator.parse(&[0x04]), Ok(Command::GetInfo));
+    assert_eq!(authenticator.parse(&[0x0B]), Ok(Command::Selection));
+    assert_eq!(authenticator.parse(&[]), Err(StatusCode::InvalidLength));
+    assert_eq!(
+        authenticator.parse(&[0x01]),
+        Err(StatusCode::InvalidCommand)
+    );
 }
 
 /// getInfo answers CTAP2_OK and the map {1: [], 3: AAGUID, 5: 1024} in canonical order: the
@@ -60,7 +139,7 @@ fn an_empty_request_is_invalid_length() {
 #[test]
 fn unimplemented_commands_are_invalid_command() {
     for code in [
-        0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x40, 0x41, 0xFF,
+        0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x40, 0x41, 0xFF,
     ] {
         assert_eq!(process(&[code, 0xA0]), [0x01], "command {code:#04x}");
     }
@@ -70,10 +149,11 @@ fn unimplemented_commands_are_invalid_command() {
 #[test]
 fn a_response_that_does_not_fit_is_other() {
     let mut authenticator = Authenticator::new(settings());
+    let mut ui = Scripted::new(Answer::Confirmed);
     let mut small = [0u8; 8];
-    assert_eq!(authenticator.process(&[0x04], &mut small), 1);
+    assert_eq!(authenticator.process(&[0x04], &mut ui, &mut small), 1);
     assert_eq!(small[0], 0x7F);
-    assert_eq!(authenticator.process(&[0x04], &mut []), 0);
+    assert_eq!(authenticator.process(&[0x04], &mut ui, &mut []), 0);
 }
 
 /// §8: an authenticator accepts messages of at least 1024 bytes, so no smaller maxMsgSize can

@@ -7,7 +7,10 @@
 #   - an instruction the app does not implement (E0 01) answers exactly 6D00,
 #   - the current screen shows the app name.
 # The FIDO HID interface, with Speculos on its U2F transport: scripts/fido_check.py
-# (INIT, PING with 1 and 7609-byte payloads, getInfo through python-fido2).
+# (INIT, PING with 1 and 7609-byte payloads, getInfo, and authenticatorSelection
+# waiting for the user: keepalives, cancel, timeout, confirm and refuse, its screen
+# compared with tests/snapshots/<model>/; SPECULOS_GOLDEN=1 writes the snapshots
+# instead).
 #
 # Expects the artifacts of scripts/device-build.sh in app/target/<target>/release/.
 # Linux only: the image is a Linux container.
@@ -19,6 +22,7 @@ docker pull --quiet "$image" >/dev/null
 docker run --rm \
     --volume "$root:/app" \
     --workdir /app \
+    --env SPECULOS_GOLDEN="${SPECULOS_GOLDEN:-0}" \
     "$image" bash -c '
         name="Structured Passkeys"
         name_hex=$(printf "%s" "$name" | od -An -tx1 | tr -d " \n")
@@ -100,7 +104,12 @@ docker run --rm \
             stop
             echo "== speculos $target, FIDO HID"
             if start "$model" U2F "$elf"; then
-                if ! /tmp/fido/bin/python scripts/fido_check.py --speculos; then
+                golden=()
+                if [[ "$SPECULOS_GOLDEN" == 1 ]]; then
+                    golden=(--golden)
+                fi
+                if ! /tmp/fido/bin/python scripts/fido_check.py --speculos --model "$model" \
+                    --snapshots tests/snapshots "${golden[@]}"; then
                     cat /tmp/speculos.log
                     status=1
                 fi
