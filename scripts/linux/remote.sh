@@ -37,18 +37,29 @@ alive() {
     [[ "$cmdline" == *"$dir/remote.sh run $dir "* ]]
 }
 
-# Whether a process of group $1 is still running. A zombie member does not
-# count: `kill -0` still finds it until its parent reaps it, which an orphan in
-# a container without a reaping init never gets.
-group_running() {
-    local file stat state pgrp
+# Whether a process of this run is still running: its leader, by its command
+# line, or any other member of its process group, by the run name its
+# environment carries (CHECK_CONTAINER_PREFIX, exported before the run starts
+# anything). Members outlive a leader killed on its own, and a process id or
+# group id the run no longer holds may belong to another process by now. A
+# zombie does not count: `kill -0` still finds it until its parent reaps it,
+# which an orphan in a container without a reaping init never gets.
+run_running() {
+    alive && return 0
+    local group file stat state pgrp pid environment
+    group=$(cat "$dir/pid" 2>/dev/null) || return 1
+    [[ "$group" =~ ^[0-9]+$ ]] || return 1
     for file in /proc/[0-9]*/stat; do
         # Read by the shell itself: one process per entry would make a scan of a
         # busy host take seconds, and the stop's wait many times its ten seconds.
         { read -r stat <"$file"; } 2>/dev/null || continue
         # The fields after the command name, which may hold spaces and parentheses.
         read -r state _ pgrp _ <<<"${stat##*) }"
-        if [[ "$pgrp" == "$1" && "$state" != Z ]]; then
+        [[ "$pgrp" == "$group" && "$state" != Z ]] || continue
+        pid=${file#/proc/}
+        pid=${pid%/stat}
+        environment=$(tr '\0' '\n' 2>/dev/null <"/proc/$pid/environ") || continue
+        if [[ $'\n'"$environment"$'\n' == *$'\n'"CHECK_CONTAINER_PREFIX=$name"$'\n'* ]]; then
             return 0
         fi
     done
@@ -78,10 +89,10 @@ case "$mode" in
         ;;
     stop)
         status=0
-        if alive; then
+        if run_running; then
             # The run leads its process group (setsid), which its docker clients are in.
             group=$(cat "$dir/pid")
-            # SIGTERM first, SIGKILL for what is left after ten seconds; a group
+            # SIGTERM first, SIGKILL for what is left after ten seconds; a run
             # still running after both fails the stop, so its directory and
             # containers are not removed from under it.
             for signal in TERM KILL; do
@@ -89,11 +100,11 @@ case "$mode" in
                 # Measured by the clock: a scan of a busy host takes time of its own.
                 deadline=$((SECONDS + 10))
                 while ((SECONDS < deadline)); do
-                    group_running "$group" || break 2
+                    run_running || break 2
                     sleep 0.2
                 done
             done
-            if group_running "$group"; then
+            if run_running; then
                 echo "the run's process group $group survived SIGKILL" >&2
                 exit 1
             fi

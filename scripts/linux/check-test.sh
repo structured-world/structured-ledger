@@ -15,6 +15,10 @@
 #   - a stopped check (SIGTERM; a background job of this script ignores
 #     SIGINT) whose run ignores SIGTERM: the remote run and its directory are
 #     gone;
+#   - a run whose leader is killed while its container runs: the check fails
+#     and the container is stopped;
+#   - a run directory left on the host under the same name is neither taken
+#     over nor removed;
 #   - a process group whose only member is a zombie counts as stopped;
 #   - the checkout the test runs from keeps its artifacts: the checks run in a
 #     copy of the scripts.
@@ -227,6 +231,39 @@ else
     kill -TERM "$check" 2>/dev/null || true
     wait "$check" || true
 fi
+
+# A run whose leader is killed while its container still runs: the check
+# fails, and stopping it ends what is left of the run.
+FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 start_check orphaned
+if wait_for 30 run_started && wait_for 30 container_started; then
+    dir=$(run_dir)
+    group=$(cat "$dir/pid")
+    kill -KILL "$group"
+    if wait_for 40 check_ended; then
+        wait "$check" && fail "orphaned: the check passed"
+        [[ ! -e "$dir" ]] || fail "orphaned: $dir left on the host"
+        wait_for 10 group_gone "$group" || fail "orphaned: the run's container is still alive"
+    else
+        fail "orphaned: the check kept polling a run without its leader"
+        kill -TERM "$check"
+        wait "$check" || true
+    fi
+else
+    fail "orphaned: the run did not start"
+    kill -TERM "$check" 2>/dev/null || true
+    wait "$check" || true
+fi
+
+# A run directory already on the host under the run's name (left by an earlier
+# run that was cut off) is not taken over, nor removed.
+stale="/tmp/structured-passkeys-check-test-stale-$$"
+mkdir -m 700 "$stale"
+echo 0 >"$stale/status"
+echo stale >"$stale/artifacts.tar"
+FAKE_SSH_DROPS="" CHECK_RUN_ID=$(basename "$stale") start_check stale
+wait "$check" && fail "stale: the check took over $stale"
+[[ "$(cat "$stale/status" 2>/dev/null)" == 0 ]] || fail "stale: $stale was changed or removed"
+rm -rf "$stale"
 
 # A stopped check, its run ignoring SIGTERM.
 FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 FAKE_DOCKER_IGNORE_TERM=1 start_check stopped

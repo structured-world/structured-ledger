@@ -55,9 +55,12 @@ ref="refs/structured-passkeys-check/snapshot-$$"
 ssh_options=(-o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=15
     -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 # Random, not the local process id: runs from different machines must not meet
-# under one name. `mkdir` below refuses an existing directory all the same.
-run_id="structured-passkeys-check-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+# under one name. The directory is taken below only if it does not exist yet.
+# CHECK_RUN_ID names the run instead, for the tests of this script.
+run_id="${CHECK_RUN_ID:-structured-passkeys-check-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')}"
 remote_dir="/tmp/$run_id"
+# Marks the remote directory as this run's.
+owner=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 # Set while the remote directory may exist.
 remote_pending=0
 
@@ -99,8 +102,11 @@ cleanup() {
     git -C "$root" update-ref -d "$ref" 2>/dev/null || true
     rm -rf "$work"
     if [[ $remote_pending -eq 1 ]]; then
-        # Run with bash explicitly: the account's login shell may be any POSIX shell.
-        if ! remote "if [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir; else rm -rf $remote_dir; fi"; then
+        # Only a directory this run owns goes; remote.sh runs with bash explicitly,
+        # since the account's login shell may be any POSIX shell.
+        if ! remote "if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" != $owner ]; then exit 0;
+            elif [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir;
+            else rm -rf $remote_dir; fi"; then
             echo "remote directory $remote_dir could not be removed" >&2
             rc=1
         fi
@@ -134,10 +140,15 @@ git -C "$root" bundle create "$work/snapshot.bundle" "$ref" 2>/dev/null
 git -C "$root" show "$commit:scripts/linux/remote.sh" >"$work/remote.sh"
 
 # Pending before the mkdir: its connection may drop after the directory exists,
-# and the cleanup tolerates a directory that was never created. A retried mkdir
-# finds the directory its first attempt made.
+# and the cleanup removes a directory only when it holds this run's owner token.
+# The token also tells a retried mkdir the directory its first attempt made from
+# one an earlier run left under the same name, which is refused.
 remote_pending=1
-remote "mkdir -m 700 $remote_dir 2>/dev/null || test -d $remote_dir"
+if ! remote "mkdir -m 700 $remote_dir 2>/dev/null && echo $owner > $remote_dir/owner ||
+    [ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ]"; then
+    echo "$destination:$remote_dir exists already and is not this run's" >&2
+    exit 1
+fi
 remote "cat > $remote_dir/snapshot.bundle" "$work/snapshot.bundle"
 remote "cat > $remote_dir/remote.sh" "$work/remote.sh"
 
