@@ -20,7 +20,8 @@
 #   - a run directory left on the host under the same name is neither taken
 #     over nor removed, while an empty one without an owner is taken;
 #   - a container that goes between its listing and its removal does not fail
-#     the cleanup;
+#     the cleanup, and a cleanup that cannot remove the containers keeps
+#     failing across a dropped connection;
 #   - a process group whose only member is a zombie counts as stopped;
 #   - the checkout the test runs from keeps its artifacts: the checks run in a
 #     copy of the scripts.
@@ -66,6 +67,13 @@ command="${!#}"
 count_file="$FAKE_HOST_STATE/ssh-calls"
 call=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
 echo "$call" >"$count_file"
+# The first command containing FAKE_SSH_DROP_AFTER runs, then its connection drops.
+if [[ -n "${FAKE_SSH_DROP_AFTER:-}" && "$command" == *"$FAKE_SSH_DROP_AFTER"* &&
+    ! -e "$FAKE_HOST_STATE/dropped-after" ]]; then
+    touch "$FAKE_HOST_STATE/dropped-after"
+    bash -c "$command" >/dev/null 2>&1 || true
+    exit 255
+fi
 for drop in ${FAKE_SSH_DROPS//,/ }; do
     if [[ "$drop" == "${call}b" ]]; then
         exit 255
@@ -110,6 +118,11 @@ case "$1" in
     # With FAKE_DOCKER_RACE a container is listed once and gone when removed, as
     # one that exits in between under --rm.
     ps)
+        # With FAKE_DOCKER_PS_FAIL the daemon cannot answer.
+        if [[ -n "${FAKE_DOCKER_PS_FAIL:-}" ]]; then
+            echo "Cannot connect to the Docker daemon" >&2
+            exit 1
+        fi
         if [[ -n "${FAKE_DOCKER_RACE:-}" && ! -e "$FAKE_HOST_STATE/listed" ]]; then
             touch "$FAKE_HOST_STATE/listed"
             echo 0123456789ab
@@ -292,6 +305,15 @@ rm -rf "$empty" "$empty.new"
 # A container that goes between listing and removal is no cleanup failure.
 FAKE_SSH_DROPS="" FAKE_DOCKER_RACE=1 start_check race
 wait "$check" || fail "race: a container gone before its removal failed the cleanup"
+
+# A cleanup that cannot remove the containers keeps failing when its connection
+# drops after it ran: the retry finds the run still to clean, not a clean host.
+FAKE_SSH_DROPS="" FAKE_DOCKER_PS_FAIL=1 FAKE_SSH_DROP_AFTER="remote.sh stop" start_check cleanup
+if wait "$check"; then
+    fail "cleanup: the check passed with its containers unknown"
+fi
+dir=$(run_dir)
+[[ -n "$dir" ]] && rm -rf "$dir"
 
 # A stopped check, its run ignoring SIGTERM.
 FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 FAKE_DOCKER_IGNORE_TERM=1 start_check stopped

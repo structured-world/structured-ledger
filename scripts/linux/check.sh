@@ -160,9 +160,12 @@ git -C "$root" show "$commit:scripts/linux/remote.sh" >"$work/remote.sh"
 # again. The rename takes an empty directory, which holds nothing of any run,
 # and fails on a directory an earlier run left with its files, which is refused.
 remote_pending=1
+# An attempt cut off on this side may still run on the host and rename first,
+# so a failed rename looks at the owner again.
 if ! remote "[ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ] || {
     mkdir -p -m 700 $remote_dir.new && echo $owner > $remote_dir.new/owner &&
-    mv -T $remote_dir.new $remote_dir 2>/dev/null; }"; then
+    mv -T $remote_dir.new $remote_dir 2>/dev/null; } ||
+    [ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ]"; then
     echo "$destination:$remote_dir exists already and is not this run's" >&2
     exit 1
 fi

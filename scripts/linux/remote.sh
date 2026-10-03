@@ -92,13 +92,16 @@ case "$mode" in
         if run_running; then
             # The run leads its process group (setsid), which its docker clients are in.
             group=$(cat "$dir/pid")
-            # SIGTERM first, SIGKILL for what is left after ten seconds; a run
+            # SIGTERM first, SIGKILL for what is left after thirty seconds; a run
             # still running after both fails the stop, so its directory and
-            # containers are not removed from under it.
+            # containers are not removed from under it. The grace outlasts the
+            # cleanup of the run's own self-test (scripts/linux/check-test.sh),
+            # whose fake runs live in sessions of their own and need up to
+            # twenty seconds to be stopped by it.
             for signal in TERM KILL; do
                 kill "-$signal" -- "-$group" 2>/dev/null
                 # Measured by the clock: a scan of a busy host takes time of its own.
-                deadline=$((SECONDS + 10))
+                deadline=$((SECONDS + 30))
                 while ((SECONDS < deadline)); do
                     run_running || break 2
                     sleep 0.2
@@ -127,7 +130,12 @@ case "$mode" in
                 status=1
             fi
         done
-        rm -rf "$dir" || status=1
+        # The directory (and its owner token) stays while a container may be
+        # left, so a stop retried after a dropped connection tries again instead
+        # of finding nothing to clean.
+        if [[ $status -eq 0 ]]; then
+            rm -rf "$dir" || status=1
+        fi
         exit "$status"
         ;;
     run) ;;
