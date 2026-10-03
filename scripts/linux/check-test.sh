@@ -22,6 +22,7 @@
 #   - a container that goes between its listing and its removal does not fail
 #     the cleanup, and a cleanup that cannot remove the containers keeps
 #     failing across a dropped connection;
+#   - a stop that carries another run's owner token touches nothing;
 #   - a process group whose only member is a zombie counts as stopped;
 #   - the checkout the test runs from keeps its artifacts: the checks run in a
 #     copy of the scripts.
@@ -316,6 +317,25 @@ if wait "$check"; then
 fi
 dir=$(run_dir)
 [[ -n "$dir" ]] && rm -rf "$dir"
+
+# A stop that carries another run's owner token touches nothing: a cleanup
+# delayed past its retry may meet a later run under the same name.
+foreign="/tmp/structured-passkeys-check-test-foreign-$$"
+mkdir -m 700 "$foreign"
+cp "$repo/scripts/linux/remote.sh" "$foreign/remote.sh"
+echo later-run >"$foreign/owner"
+# A stand-in for the later run: its command line names it as remote.sh run does.
+setsid bash -c 'sleep 30; : '"$foreign/remote.sh run $foreign "'x' >/dev/null 2>&1 &
+# Killed by this test below: no job report for it.
+disown
+sleep 0.5
+stand_in=$(pgrep -f "$foreign/remote.sh run $foreign " | head -n 1)
+echo "$stand_in" >"$foreign/pid"
+bash "$foreign/remote.sh" stop "$foreign" earlier-run || true
+kill -0 "$stand_in" 2>/dev/null || fail "foreign: a stop with another token stopped the run"
+[[ -f "$foreign/owner" ]] || fail "foreign: a stop with another token removed the run directory"
+kill -KILL -- "-$stand_in" 2>/dev/null || true
+rm -rf "$foreign"
 
 # A stopped check, its run ignoring SIGTERM.
 FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 FAKE_DOCKER_IGNORE_TERM=1 start_check stopped

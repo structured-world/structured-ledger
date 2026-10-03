@@ -4,7 +4,7 @@
 #
 #   remote.sh launch <run dir> <bundle ref> device|speculos|golden
 #   remote.sh state <run dir>
-#   remote.sh stop <run dir>
+#   remote.sh stop <run dir> <owner token>
 #
 # `launch` starts the run detached from the SSH session (setsid, nohup), its
 # output appended to <run dir>/run.log; launching again is harmless, because the
@@ -18,7 +18,10 @@
 #
 # `state` prints `starting` (not launched yet), `running`, `done <status>` or
 # `lost` (ended without a status). `stop` stops a live run and its containers,
-# then removes <run dir>; it fails when anything could not be removed.
+# then removes <run dir>; it fails when anything could not be removed. It acts
+# only while <run dir>/owner holds the token it was given, checked again before
+# every step that destroys something: a stop delayed past its retry may meet a
+# later run under the same name, which it leaves alone.
 set -uo pipefail
 
 mode="${1:?mode: launch, state or stop}"
@@ -88,6 +91,12 @@ case "$mode" in
         exit 0
         ;;
     stop)
+        token="${3:?owner token}"
+        # Whether the run directory is still the one this stop was given.
+        owned() {
+            [[ "$(cat "$dir/owner" 2>/dev/null)" == "$token" ]]
+        }
+        owned || exit 0
         status=0
         if run_running; then
             # The run leads its process group (setsid), which its docker clients are in.
@@ -104,6 +113,7 @@ case "$mode" in
                 grace=10
             fi
             for signal in TERM KILL; do
+                owned || exit 0
                 kill "-$signal" -- "-$group" 2>/dev/null
                 # Measured by the clock: a scan of a busy host takes time of its own.
                 deadline=$((SECONDS + grace))
@@ -121,6 +131,7 @@ case "$mode" in
         # answer leaves the containers unknown. A removal that fails is checked
         # again, since a container run with --rm removes itself when it exits,
         # which can happen between listing and removing it.
+        owned || exit 0
         for container in "$name-build" "$name-speculos"; do
             if ! found=$(docker ps --all --quiet --filter "name=^/$container\$"); then
                 echo "cannot list containers to remove $container" >&2
@@ -140,7 +151,7 @@ case "$mode" in
         # of finding nothing to clean.
         # The owner token goes last, so a removal cut off half way still marks
         # the directory as this run's for the retry.
-        if [[ $status -eq 0 ]]; then
+        if [[ $status -eq 0 ]] && owned; then
             find "$dir" -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
                 rm -f "$dir/owner" && rmdir "$dir" || status=1
         fi

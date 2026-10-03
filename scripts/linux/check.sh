@@ -123,7 +123,7 @@ cleanup() {
         # since the account's login shell may be any POSIX shell.
         # The staging directory carries this run's token and holds nothing else.
         if ! remote "rm -rf $staging; if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" != $owner ]; then exit 0;
-            elif [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir;
+            elif [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir $owner;
             else find $remote_dir -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
                 rm -f $remote_dir/owner && rmdir $remote_dir; fi"; then
             echo "remote directory $remote_dir could not be removed" >&2
