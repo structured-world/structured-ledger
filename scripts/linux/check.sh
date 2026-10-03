@@ -19,11 +19,19 @@
 # shared. The dev-tools image itself stays: it is a tool the host keeps, like a
 # toolchain.
 #
+# The connection to the host may drop at any time, so the run does not live in
+# an SSH session: it starts detached on the host and writes its log and exit
+# status into its directory there. This side follows the log by polling and
+# reconnects after a dropped connection, for up to CHECK_RECONNECT_SECONDS
+# (default 1800) without a successful connection. A stopped run (Ctrl-C) stops
+# the remote run and its containers too.
+#
 # STRUCTURED_PASSKEYS_LINUX is an SSH destination that can run docker.
 set -euo pipefail
 
 destination="${STRUCTURED_PASSKEYS_LINUX:?set STRUCTURED_PASSKEYS_LINUX to the SSH destination of the Linux check host}"
 action="${1:?action: device}"
+reconnect_seconds="${CHECK_RECONNECT_SECONDS:-1800}"
 
 case "$action" in
     device | speculos | golden) ;;
@@ -46,8 +54,38 @@ run_id="structured-passkeys-check-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 remote_dir="/tmp/$run_id"
 # Set while the remote directory may exist.
 remote_pending=0
+# Set once the remote run has written its exit status.
+remote_done=0
 
-# Removes the local snapshot and the remote directory; a failed remote removal
+# Runs one idempotent command on the host, reconnecting after a dropped
+# connection until it ran or the connection stayed down for $reconnect_seconds;
+# returns the command's status, 255 when it never ran (ssh exits 255 when the
+# connection failed). The command reads the file $2 (nothing without it) and
+# writes into the file $3 (this script's output without it); both are opened
+# anew for every attempt, so a retry neither sends nor keeps a partial stream.
+# shellcheck disable=SC2029 # the commands are built here, paths expanded on purpose
+remote() {
+    local since=$SECONDS rc
+    while :; do
+        rc=0
+        if [[ -n "${3:-}" ]]; then
+            ssh "${ssh_options[@]}" "$destination" "$1" <"${2:-/dev/null}" >"$3" || rc=$?
+        else
+            ssh "${ssh_options[@]}" "$destination" "$1" <"${2:-/dev/null}" || rc=$?
+        fi
+        if [[ $rc -ne 255 ]]; then
+            return "$rc"
+        fi
+        if ((SECONDS - since >= reconnect_seconds)); then
+            echo "no connection to $destination for ${reconnect_seconds}s" >&2
+            return 255
+        fi
+        sleep 5
+    done
+}
+
+# Removes the local snapshot and the remote directory, stopping the remote run
+# and its containers first when it has not finished; a failed remote removal
 # fails the run.
 # Older shellcheck releases report this as SC2317, newer ones as SC2329.
 # shellcheck disable=SC2317,SC2329 # called by the EXIT trap
@@ -56,10 +94,17 @@ cleanup() {
     # The ref is absent when the run stopped before creating it.
     git -C "$root" update-ref -d "$ref" 2>/dev/null || true
     rm -rf "$work"
-    # shellcheck disable=SC2029 # the path is meant to be expanded here
-    if [[ $remote_pending -eq 1 ]] && ! ssh "${ssh_options[@]}" "$destination" "rm -rf $remote_dir"; then
-        echo "remote directory $remote_dir could not be removed" >&2
-        rc=1
+    if [[ $remote_pending -eq 1 ]]; then
+        local stop=""
+        if [[ $remote_done -eq 0 ]]; then
+            # The run leads its own process group (setsid); its containers carry its name.
+            stop="if [ -f $remote_dir/pid ]; then kill -TERM -- -\$(cat $remote_dir/pid) 2>/dev/null; fi;"
+            stop+=" docker rm -f $run_id-build $run_id-speculos >/dev/null 2>&1;"
+        fi
+        if ! remote "$stop rm -rf $remote_dir"; then
+            echo "remote directory $remote_dir could not be removed" >&2
+            rc=1
+        fi
     fi
     exit "$rc"
 }
@@ -83,33 +128,59 @@ commit=$(GIT_AUTHOR_NAME=snapshot GIT_AUTHOR_EMAIL=snapshot@localhost \
     git -C "$root" commit-tree "$tree" -p HEAD -m "working tree snapshot")
 git -C "$root" update-ref "$ref" "$commit"
 git -C "$root" bundle create "$work/snapshot.bundle" "$ref" 2>/dev/null
-
-# Pending before the mkdir: its connection may drop after the directory exists,
-# and the cleanup tolerates a directory that was never created.
-remote_pending=1
-# shellcheck disable=SC2029 # the path is meant to be expanded here
-ssh "${ssh_options[@]}" "$destination" "mkdir -m 700 $remote_dir"
-# shellcheck disable=SC2029 # the path is meant to be expanded here
-ssh "${ssh_options[@]}" "$destination" "cat > $remote_dir/snapshot.bundle" <"$work/snapshot.bundle"
 # The remote half comes from the snapshot, so the run executes exactly the tree
 # it reports.
-# shellcheck disable=SC2029 # the path is meant to be expanded here
-git -C "$root" show "$commit:scripts/linux/remote.sh" |
-    ssh "${ssh_options[@]}" "$destination" "cat > $remote_dir/remote.sh"
+git -C "$root" show "$commit:scripts/linux/remote.sh" >"$work/remote.sh"
+
+# Pending before the mkdir: its connection may drop after the directory exists,
+# and the cleanup tolerates a directory that was never created. A retried mkdir
+# finds the directory its first attempt made.
+remote_pending=1
+remote "mkdir -m 700 $remote_dir 2>/dev/null || test -d $remote_dir"
+remote "cat > $remote_dir/snapshot.bundle" "$work/snapshot.bundle"
+remote "cat > $remote_dir/remote.sh" "$work/remote.sh"
 
 echo "snapshot ${commit:0:12} of $(git -C "$root" rev-parse --short HEAD) with local changes"
-status=0
-# shellcheck disable=SC2029 # the paths are meant to be expanded here
-ssh "${ssh_options[@]}" "$destination" "bash $remote_dir/remote.sh $remote_dir $ref $action" ||
-    status=$?
+echo "remote run in $destination:$remote_dir"
+# Started once: a retry after a dropped connection finds the marker and starts
+# nothing. setsid gives the run its own process group, nohup and the redirects
+# detach it from the SSH session.
+remote "mkdir $remote_dir/started 2>/dev/null || exit 0; cd $remote_dir &&
+    setsid nohup bash remote.sh $remote_dir $ref $action >run.log 2>&1 </dev/null &"
+
+# Shows the log from the byte already shown; returns non-zero when the host
+# stayed out of reach.
+shown=0
+follow() {
+    local chunk="$work/chunk" size
+    remote "tail -c +$((shown + 1)) $remote_dir/run.log 2>/dev/null || true" "" "$chunk" || return 1
+    size=$(wc -c <"$chunk" | tr -d ' ')
+    cat "$chunk"
+    shown=$((shown + size))
+}
+# The status file appears after the last line of the log, so one more read
+# after it shows the rest.
+status=""
+while :; do
+    if ! follow || ! remote "cat $remote_dir/status 2>/dev/null || true" "" "$work/status"; then
+        echo "lost $destination; stopping the remote run" >&2
+        exit 1
+    fi
+    status=$(tr -d ' \n' <"$work/status")
+    if [[ -n "$status" ]]; then
+        remote_done=1
+        follow || true
+        break
+    fi
+    sleep 5
+done
 
 # Artifacts come back even from a failed run: the targets that built are worth
 # looking at.
 artifacts="$root/target/device"
 rm -rf "$artifacts"
 mkdir -p "$artifacts"
-# shellcheck disable=SC2029 # the path is meant to be expanded here
-if ssh "${ssh_options[@]}" "$destination" "test -f $remote_dir/artifacts.tar && cat $remote_dir/artifacts.tar" >"$work/artifacts.tar" &&
+if remote "test -f $remote_dir/artifacts.tar && cat $remote_dir/artifacts.tar" "" "$work/artifacts.tar" &&
     [[ -s "$work/artifacts.tar" ]]; then
     tar -x -f "$work/artifacts.tar" -C "$artifacts"
     echo "artifacts in $artifacts"
@@ -118,8 +189,7 @@ else
     status=1
 fi
 if [[ "$action" == golden ]]; then
-    # shellcheck disable=SC2029 # the path is meant to be expanded here
-    if ssh "${ssh_options[@]}" "$destination" "test -f $remote_dir/snapshots.tar && cat $remote_dir/snapshots.tar" >"$work/snapshots.tar" &&
+    if remote "test -f $remote_dir/snapshots.tar && cat $remote_dir/snapshots.tar" "" "$work/snapshots.tar" &&
         [[ -s "$work/snapshots.tar" ]]; then
         mkdir -p "$root/tests"
         tar -x -f "$work/snapshots.tar" -C "$root/tests"
