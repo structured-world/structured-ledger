@@ -43,7 +43,9 @@ alive() {
 group_running() {
     local file stat state pgrp
     for file in /proc/[0-9]*/stat; do
-        stat=$(cat "$file" 2>/dev/null) || continue
+        # Read by the shell itself: one process per entry would make a scan of a
+        # busy host take seconds, and the stop's wait many times its ten seconds.
+        { read -r stat <"$file"; } 2>/dev/null || continue
         # The fields after the command name, which may hold spaces and parentheses.
         read -r state _ pgrp _ <<<"${stat##*) }"
         if [[ "$pgrp" == "$1" && "$state" != Z ]]; then
@@ -79,11 +81,22 @@ case "$mode" in
         if alive; then
             # The run leads its process group (setsid), which its docker clients are in.
             group=$(cat "$dir/pid")
-            kill -TERM -- "-$group" 2>/dev/null
-            for _ in $(seq 1 50); do
-                group_running "$group" || break
-                sleep 0.2
+            # SIGTERM first, SIGKILL for what is left after ten seconds; a group
+            # still running after both fails the stop, so its directory and
+            # containers are not removed from under it.
+            for signal in TERM KILL; do
+                kill "-$signal" -- "-$group" 2>/dev/null
+                # Measured by the clock: a scan of a busy host takes time of its own.
+                deadline=$((SECONDS + 10))
+                while ((SECONDS < deadline)); do
+                    group_running "$group" || break 2
+                    sleep 0.2
+                done
             done
+            if group_running "$group"; then
+                echo "the run's process group $group survived SIGKILL" >&2
+                exit 1
+            fi
         fi
         # Only a container that does not exist is no error: a daemon that cannot
         # answer leaves the containers unknown.

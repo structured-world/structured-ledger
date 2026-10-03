@@ -13,13 +13,43 @@
 #   - a run that dies without writing its status: the check fails instead of
 #     polling forever, and the host is left clean;
 #   - a stopped check (SIGTERM; a background job of this script ignores
-#     SIGINT): the remote run and its directory are gone.
+#     SIGINT) whose run ignores SIGTERM: the remote run and its directory are
+#     gone;
+#   - a process group whose only member is a zombie counts as stopped;
+#   - the checkout the test runs from keeps its artifacts: the checks run in a
+#     copy of the scripts.
 set -euo pipefail
 
 root=$(git rev-parse --show-toplevel)
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+check=""
+# A check still running is stopped before the fake host it uses goes: without
+# its fake ssh it could not clean up its run.
+# Older shellcheck releases report this as SC2317, newer ones as SC2329.
+# shellcheck disable=SC2317,SC2329 # called by the EXIT trap
+finish() {
+    local code=$?
+    if [[ -n "$check" ]] && kill -0 "$check" 2>/dev/null; then
+        kill -TERM "$check" 2>/dev/null || true
+        wait "$check" 2>/dev/null || true
+    fi
+    rm -rf "$tmp"
+    exit "$code"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir "$tmp/bin"
+
+# The checks run in a copy of the scripts as a repository of its own, so the
+# fake artifacts they fetch never replace the artifacts of the checkout under
+# test.
+repo="$tmp/repo"
+mkdir "$repo"
+cp -R "$root/scripts" "$repo/"
+git -C "$repo" init -q
+git -C "$repo" add -A
+git -C "$repo" -c user.name=check-test -c user.email=check-test@localhost commit -qm scripts
 
 # ssh [options] <destination> <command>: runs the command here. The calls whose
 # numbers FAKE_SSH_DROPS lists ("3b,5a": call 3 drops before its command runs,
@@ -43,11 +73,15 @@ exec bash -c "$command"
 EOF
 
 # docker pull|run|ps|rm: `run` writes every target's artifacts into the mounted
-# checkout after FAKE_DOCKER_SECONDS; `ps` knows no containers.
+# checkout after FAKE_DOCKER_SECONDS, ignoring SIGTERM with FAKE_DOCKER_IGNORE_TERM;
+# `ps` knows no containers.
 cat >"$tmp/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
     run)
+        if [[ -n "${FAKE_DOCKER_IGNORE_TERM:-}" ]]; then
+            trap '' TERM
+        fi
         shift
         app=""
         while [[ $# -gt 0 ]]; do
@@ -80,6 +114,9 @@ export CHECK_TEST_NESTED=1
 # A connection that stays down ends the check quickly here.
 export CHECK_RECONNECT_SECONDS=20
 
+# The checkout this test runs from keeps its own artifacts.
+artifacts_before=$(ls -lR "$root/target/device" 2>&1 || true)
+
 failures=0
 fail() {
     echo "FAIL: $*" >&2
@@ -93,7 +130,7 @@ start_check() {
     export FAKE_HOST_STATE="$tmp/$name"
     mkdir -p "$FAKE_HOST_STATE"
     out="$tmp/$name.out"
-    (cd "$root" && exec scripts/linux/check.sh device) >"$out" 2>&1 &
+    (cd "$repo" && exec scripts/linux/check.sh device) >"$out" 2>&1 &
     check=$!
 }
 
@@ -121,6 +158,11 @@ run_started() {
     [[ -n "$dir" && -f "$dir/pid" ]]
 }
 
+# The run's fake container has started.
+container_started() {
+    grep -qs '^fake container$' "$(run_dir)/run.log"
+}
+
 # The check process has ended.
 check_ended() {
     ! kill -0 "$check" 2>/dev/null
@@ -132,7 +174,8 @@ check_ended() {
 group_gone() {
     local file stat state pgrp
     for file in /proc/[0-9]*/stat; do
-        stat=$(cat "$file" 2>/dev/null) || continue
+        # Read by the shell itself: one process per entry makes a scan slow.
+        { read -r stat <"$file"; } 2>/dev/null || continue
         # The fields after the command name, which may hold spaces and parentheses.
         read -r state _ pgrp _ <<<"${stat##*) }"
         if [[ "$pgrp" == "$1" && "$state" != Z ]]; then
@@ -159,7 +202,7 @@ FAKE_SSH_DROPS="2b,4a,6b,7a,9b" FAKE_DOCKER_SECONDS=3 start_check drops
 if wait "$check"; then
     dir=$(run_dir)
     [[ $(grep -c '^== PASSED' "$out") -eq 1 ]] || fail "drops: the run did not complete exactly once"
-    [[ -f "$root/target/device/apex_p/release/structured-passkeys-app" ]] || fail "drops: no artifacts"
+    [[ -f "$repo/target/device/apex_p/release/structured-passkeys-app" ]] || fail "drops: no artifacts"
     [[ -n "$dir" && ! -e "$dir" ]] || fail "drops: $dir left on the host"
 else
     fail "drops: the check failed"
@@ -185,9 +228,9 @@ else
     wait "$check" || true
 fi
 
-# A stopped check.
-FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 start_check stopped
-if wait_for 30 run_started; then
+# A stopped check, its run ignoring SIGTERM.
+FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 FAKE_DOCKER_IGNORE_TERM=1 start_check stopped
+if wait_for 30 run_started && wait_for 30 container_started; then
     dir=$(run_dir)
     group=$(cat "$dir/pid")
     kill -TERM "$check"
@@ -199,6 +242,9 @@ else
     kill -TERM "$check" 2>/dev/null || true
     wait "$check" || true
 fi
+
+[[ "$(ls -lR "$root/target/device" 2>&1 || true)" == "$artifacts_before" ]] ||
+    fail "the artifacts of the checkout under test changed"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures check-test failures" >&2
