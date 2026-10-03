@@ -104,7 +104,8 @@ cleanup() {
     if [[ $remote_pending -eq 1 ]]; then
         # Only a directory this run owns goes; remote.sh runs with bash explicitly,
         # since the account's login shell may be any POSIX shell.
-        if ! remote "if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" != $owner ]; then exit 0;
+        # The staging directory carries this run's name and holds nothing else.
+        if ! remote "rm -rf $remote_dir.new; if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" != $owner ]; then exit 0;
             elif [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir;
             else rm -rf $remote_dir; fi"; then
             echo "remote directory $remote_dir could not be removed" >&2
@@ -139,13 +140,18 @@ git -C "$root" bundle create "$work/snapshot.bundle" "$ref" 2>/dev/null
 # it reports.
 git -C "$root" show "$commit:scripts/linux/remote.sh" >"$work/remote.sh"
 
-# Pending before the mkdir: its connection may drop after the directory exists,
-# and the cleanup removes a directory only when it holds this run's owner token.
-# The token also tells a retried mkdir the directory its first attempt made from
-# one an earlier run left under the same name, which is refused.
+# Pending before the directory is made: its connection may drop after it
+# exists, and the cleanup removes a directory only when it holds this run's
+# owner token. The directory is built with its token under a staging name and
+# renamed into place in one step, so it never exists without the token; a retry
+# finds it marked as this run's, or rebuilds the staging directory and renames
+# again. The rename takes an empty directory (a cut-off attempt of an earlier
+# version left nothing in it) and fails on a directory an earlier run left with
+# its files, which is refused.
 remote_pending=1
-if ! remote "mkdir -m 700 $remote_dir 2>/dev/null && echo $owner > $remote_dir/owner ||
-    [ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ]"; then
+if ! remote "[ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ] || {
+    mkdir -p -m 700 $remote_dir.new && echo $owner > $remote_dir.new/owner &&
+    mv -T $remote_dir.new $remote_dir 2>/dev/null; }"; then
     echo "$destination:$remote_dir exists already and is not this run's" >&2
     exit 1
 fi

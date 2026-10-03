@@ -110,12 +110,20 @@ case "$mode" in
             fi
         fi
         # Only a container that does not exist is no error: a daemon that cannot
-        # answer leaves the containers unknown.
+        # answer leaves the containers unknown. A removal that fails is checked
+        # again, since a container run with --rm removes itself when it exits,
+        # which can happen between listing and removing it.
         for container in "$name-build" "$name-speculos"; do
             if ! found=$(docker ps --all --quiet --filter "name=^/$container\$"); then
                 echo "cannot list containers to remove $container" >&2
                 status=1
-            elif [[ -n "$found" ]] && ! docker rm --force "$container" >/dev/null; then
+                continue
+            fi
+            if [[ -z "$found" ]] || docker rm --force "$container" >/dev/null; then
+                continue
+            fi
+            if ! found=$(docker ps --all --quiet --filter "name=^/$container\$") || [[ -n "$found" ]]; then
+                echo "cannot remove container $container" >&2
                 status=1
             fi
         done

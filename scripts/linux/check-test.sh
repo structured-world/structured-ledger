@@ -18,7 +18,9 @@
 #   - a run whose leader is killed while its container runs: the check fails
 #     and the container is stopped;
 #   - a run directory left on the host under the same name is neither taken
-#     over nor removed;
+#     over nor removed, while an empty one without an owner is taken;
+#   - a container that goes between its listing and its removal does not fail
+#     the cleanup;
 #   - a process group whose only member is a zombie counts as stopped;
 #   - the checkout the test runs from keeps its artifacts: the checks run in a
 #     copy of the scripts.
@@ -105,8 +107,21 @@ case "$1" in
             done
         done
         ;;
-    pull | rm) ;;
-    ps) ;;
+    # With FAKE_DOCKER_RACE a container is listed once and gone when removed, as
+    # one that exits in between under --rm.
+    ps)
+        if [[ -n "${FAKE_DOCKER_RACE:-}" && ! -e "$FAKE_HOST_STATE/listed" ]]; then
+            touch "$FAKE_HOST_STATE/listed"
+            echo 0123456789ab
+        fi
+        ;;
+    rm)
+        if [[ -n "${FAKE_DOCKER_RACE:-}" ]]; then
+            echo "Error response from daemon: No such container" >&2
+            exit 1
+        fi
+        ;;
+    pull) ;;
     *) exit 1 ;;
 esac
 EOF
@@ -264,6 +279,19 @@ FAKE_SSH_DROPS="" CHECK_RUN_ID=$(basename "$stale") start_check stale
 wait "$check" && fail "stale: the check took over $stale"
 [[ "$(cat "$stale/status" 2>/dev/null)" == 0 ]] || fail "stale: $stale was changed or removed"
 rm -rf "$stale"
+
+# An empty run directory without an owner, as a first attempt cut off between
+# creating it and marking it leaves, is taken; the run passes and nothing stays.
+empty="/tmp/structured-passkeys-check-test-empty-$$"
+mkdir -m 700 "$empty"
+FAKE_SSH_DROPS="" CHECK_RUN_ID=$(basename "$empty") start_check empty
+wait "$check" || fail "empty: the check failed on its own unmarked directory"
+[[ ! -e "$empty" && ! -e "$empty.new" ]] || fail "empty: $empty left on the host"
+rm -rf "$empty" "$empty.new"
+
+# A container that goes between listing and removal is no cleanup failure.
+FAKE_SSH_DROPS="" FAKE_DOCKER_RACE=1 start_check race
+wait "$check" || fail "race: a container gone before its removal failed the cleanup"
 
 # A stopped check, its run ignoring SIGTERM.
 FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 FAKE_DOCKER_IGNORE_TERM=1 start_check stopped
