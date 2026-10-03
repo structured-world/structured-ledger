@@ -434,11 +434,15 @@ impl<S: Storage> Store<S> {
         Ok(())
     }
 
-    /// Free slots of the discoverable index, reported as `remainingDiscoverableCredentials`.
+    /// `remainingDiscoverableCredentials`: discoverable credentials that fit whatever their key
+    /// origin, so free index slots bounded by the key slots a device-only one would need. CTAP 2.2
+    /// §6.4 (member 0x14) wants zero whenever a creation may fail for lack of space, even if
+    /// a particular request would succeed.
     pub fn remaining_discoverable(&self) -> usize {
-        (0..slot_count(self.storage.index_slots()))
+        let free_entries = (0..slot_count(self.storage.index_slots()))
             .filter(|&slot| self.entry(slot).is_none())
-            .count()
+            .count();
+        free_entries.min(self.remaining_keys())
     }
 
     /// Device-only key slots free for new credentials. One free slot is always kept back for
@@ -653,9 +657,26 @@ impl<S: Storage> Store<S> {
         Ok(id)
     }
 
-    /// Gives up a reservation, wiping the key stored for it.
+    /// Gives up a reservation, wiping the key stored for it. A reservation made before a reset has
+    /// nothing left to wipe: the reset retired its key, and a newer reservation of the same index
+    /// slot may be waiting with its own.
     pub fn release(&mut self, reservation: Reservation) {
-        self.wipe_orphans(reservation.id.slot);
+        if reservation.generation != self.generation {
+            return;
+        }
+        let owner = reservation.id;
+        for key in 0..slot_count(self.storage.key_slots()) {
+            let record = self.storage.key_slot(usize::from(key));
+            let owned = record[KEY_STATE] == USED
+                && read_u32(record, KEY_GENERATION) == self.generation
+                && record[KEY_OWNED] == USED
+                && read_u16(record, KEY_OWNER_SLOT) == owner.slot
+                && read_u32(record, KEY_OWNER_SEQUENCE) == owner.sequence;
+            if owned {
+                self.storage
+                    .write_key_slot(usize::from(key), &[0; KEY_SLOT_LEN]);
+            }
+        }
     }
 
     /// Removes the entry `id` and wipes its device-only key; `false` when the index no longer

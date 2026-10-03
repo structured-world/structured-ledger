@@ -140,7 +140,12 @@ fn fresh_nvm_is_formatted() {
     assert!(!config.always_uv);
     assert!(config.pin.is_none());
     assert_eq!(config.pin_retries, PIN_RETRIES);
-    assert_eq!(store.remaining_discoverable(), 4);
+    assert_eq!(store.entries().count(), 0);
+    assert_eq!(
+        store.remaining_discoverable(),
+        1,
+        "four index slots, but keys for one device-only credential"
+    );
     assert_eq!(
         store.remaining_keys(),
         1,
@@ -170,7 +175,8 @@ fn another_layout_is_wiped_even_when_interrupted() {
     let store = Store::open(storage);
     assert_eq!(store.storage.config()[0], LAYOUT_VERSION);
     assert_eq!(store.config().epoch, 0);
-    assert_eq!(store.remaining_discoverable(), 3);
+    assert_eq!(store.entries().count(), 0);
+    assert_eq!(store.remaining_keys(), 1);
     assert_no_residue(&store);
 }
 
@@ -436,10 +442,11 @@ fn full_key_slots_are_refused() {
         Some(&device_key(2)),
     );
     assert_eq!(refused, Err(StoreError::Full));
+    assert_eq!(store.entries().count(), 1, "the reservation was released");
     assert_eq!(
         store.remaining_discoverable(),
-        1,
-        "the reservation was released"
+        0,
+        "a device-only credential would not fit"
     );
     assert_eq!(
         store.store_key(&mut crypto, None, &device_key(3)),
@@ -447,6 +454,51 @@ fn full_key_slots_are_refused() {
         "a non-discoverable key may not take the slot kept for replacements"
     );
     assert_eq!(store.remaining_keys(), 0);
+}
+
+/// `remainingDiscoverableCredentials` is zero whenever a new discoverable credential may fail
+/// for lack of space (CTAP 2.2 §6.4, member 0x14): with free index slots but no key slot for a
+/// device-only one, it is zero.
+#[test]
+fn remaining_discoverable_counts_key_slots_too() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::new(4, 3));
+    assert_eq!(store.remaining_discoverable(), 2, "two keys and the spare");
+    store
+        .store_key(&mut crypto, None, &device_key(1))
+        .expect("a non-discoverable key");
+    store
+        .store_key(&mut crypto, None, &device_key(2))
+        .expect("a non-discoverable key");
+    assert_eq!(store.entries().count(), 0);
+    assert_eq!(store.remaining_discoverable(), 0);
+}
+
+/// Releasing a reservation made before a reset leaves alone the key a newer reservation of the
+/// same index slot is waiting with, so that credential opens once committed.
+#[test]
+fn a_stale_release_keeps_a_newer_reservations_key() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::new(1, 3));
+    let stale = store
+        .reserve(&RP_A, "example.com", same_user("alice"))
+        .expect("room");
+    store
+        .store_key(&mut crypto, Some(&stale), &device_key(1))
+        .expect("a key slot");
+    store.reset().expect("an epoch left");
+    let fresh = store
+        .reserve(&RP_A, "example.com", same_user("bob"))
+        .expect("room");
+    assert_eq!(fresh.id().slot, stale.id().slot);
+    let source = store
+        .store_key(&mut crypto, Some(&fresh), &device_key(2))
+        .expect("a key slot");
+    store.release(stale);
+    store.commit(fresh, b"bob:1").expect("an ID within bounds");
+    let (index, tag) = slot_key(&source);
+    let key = store.key(index, &tag).expect("the committed key opens");
+    assert_eq!(*key.private_key, [2; KEY_LEN]);
 }
 
 /// With every key slot but the spare taken by device-only credentials, a new credential for an
