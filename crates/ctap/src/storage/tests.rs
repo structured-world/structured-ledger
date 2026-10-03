@@ -256,35 +256,65 @@ fn a_full_index_refuses_a_new_user() {
     assert_eq!(store.storage.writes(), writes);
 }
 
-/// RP IDs up to 64 bytes are kept whole; a longer one is kept truncated on a character boundary
-/// and marked so (CTAP 2.2 §6.8.7 lets the stored RP ID be truncated; the RP ID hash stays whole).
-#[test]
-fn long_rp_ids_are_kept_truncated() {
-    let mut store = Store::open(MemoryStorage::new(2, 0));
-    let longest = "a".repeat(MAX_RP_ID_LEN);
+/// The RP ID an entry keeps for `rp_id`.
+fn stored(rp_id: &str) -> String {
+    let mut store = Store::open(MemoryStorage::new(1, 0));
     let reservation = store
-        .reserve(&RP_A, &longest, same_user("alice"))
-        .expect("64 bytes fit");
+        .reserve(&RP_A, rp_id, same_user("alice"))
+        .expect("room");
     store
         .commit(reservation, b"alice:1")
         .expect("an ID within bounds");
     let entry = store.entry(0).expect("alice");
-    assert_eq!((entry.rp_id, entry.rp_id_truncated), (&*longest, false));
+    assert_eq!(entry.rp_id_hash, &RP_A, "the hash stays the full RP ID's");
+    entry.rp_id.into()
+}
 
-    // 63 ASCII bytes, then a two-byte character that would cross the 64-byte limit.
-    let long = format!("{}é.example", "b".repeat(MAX_RP_ID_LEN - 1));
-    let reservation = store
-        .reserve(&RP_B, &long, same_user("bob"))
-        .expect("a long RP ID is kept truncated");
-    store
-        .commit(reservation, b"bob:1")
-        .expect("an ID within bounds");
-    let entry = store.entry(1).expect("bob");
+/// RP IDs up to 64 bytes are kept whole; a longer one is kept in the form of CTAP 2.2 §6.8.7
+/// (its procedure with 64 bytes in place of 32): the protocol up to the first colon, U+2026, then
+/// the end of the RP ID, so RP IDs that differ only at the end stay apart.
+#[test]
+fn long_rp_ids_are_truncated_as_ctap_specifies() {
+    let longest = "a".repeat(MAX_RP_ID_LEN);
+    assert_eq!(stored(&longest), longest);
+
+    let domain = format!("{}.hostingprovider.example.net", "w".repeat(60));
     assert_eq!(
-        (entry.rp_id, entry.rp_id_truncated),
-        (&*"b".repeat(MAX_RP_ID_LEN - 1), true)
+        stored(&domain),
+        format!("…{}", &domain[domain.len() - (MAX_RP_ID_LEN - 3)..])
     );
-    assert_eq!(entry.rp_id_hash, &RP_B);
+
+    let other = format!("otherprotocol://{}.example", "y".repeat(70));
+    assert_eq!(
+        stored(&other),
+        format!(
+            "otherprotocol:…{}",
+            &other[other.len() - (MAX_RP_ID_LEN - 14 - 3)..]
+        )
+    );
+
+    // A protocol that leaves no room for the ellipsis is kept alone, cut to the limit.
+    let protocol = format!("{}://example.com", "p".repeat(70));
+    assert_eq!(stored(&protocol), "p".repeat(MAX_RP_ID_LEN));
+    let protocol = format!("{}://{}", "q".repeat(MAX_RP_ID_LEN - 2), "z".repeat(10));
+    assert_eq!(
+        stored(&protocol),
+        format!("{}:", "q".repeat(MAX_RP_ID_LEN - 2))
+    );
+}
+
+/// Where the procedure's byte offsets fall inside a UTF-8 character, the cut moves to the
+/// character boundary that keeps the stored RP ID text: the end starts one character later, the
+/// protocol stops one character earlier.
+#[test]
+fn rp_id_truncation_keeps_whole_characters() {
+    // 80 bytes of two-byte characters: the last 61 bytes would start inside one.
+    assert_eq!(stored(&"é".repeat(40)), format!("…{}", "é".repeat(30)));
+    // A protocol of 1 + 80 bytes cut at 64 would split the 32nd character.
+    assert_eq!(
+        stored(&format!("a{}:x", "é".repeat(40))),
+        format!("a{}", "é".repeat(31))
+    );
 }
 
 /// A credential ID over the maximum length or empty is refused at commit, and the reservation's

@@ -15,9 +15,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::credential_id::{
-    KeySource, MAX_CREDENTIAL_ID_LEN, SLOT_TAG_LEN, truncate_on_char_boundary,
-};
+use crate::credential_id::{KeySource, MAX_CREDENTIAL_ID_LEN, SLOT_TAG_LEN};
 use crate::crypto::{Crypto, KEY_LEN};
 use crate::ctap2::StatusCode;
 
@@ -57,8 +55,8 @@ pub const CONFIG_LEN: usize = CONFIG_SEQUENCE_LIMIT + 4;
 /// the recorded limit is never handed out again, also after a reopen or a reset.
 const SEQUENCE_BLOCK: u32 = 32;
 
-/// High bit of the stored RP ID length: the RP ID was longer and is kept truncated.
-const RP_ID_TRUNCATED: u8 = 0x80;
+/// Marks where a stored RP ID was cut (CTAP 2.2 §6.8.7: U+2026, horizontal ellipsis).
+const ELLIPSIS: &str = "…";
 
 // Index entry: state, generation, creation sequence, RP ID hash, RP ID, credential ID.
 const ENTRY_STATE: usize = 0;
@@ -197,10 +195,9 @@ pub struct IndexEntry<'a> {
     /// SHA-256 of the RP ID.
     pub rp_id_hash: &'a [u8; KEY_LEN],
     /// The RP ID, kept so credential management can list relying parties without a key; at
-    /// most [`MAX_RP_ID_LEN`] bytes.
+    /// most [`MAX_RP_ID_LEN`] bytes, a longer one in the truncated form of CTAP 2.2 §6.8.7. Only
+    /// shown, never compared: lookups use `rp_id_hash`.
     pub rp_id: &'a str,
-    /// Whether `rp_id` is the start of a longer RP ID, cut on a character boundary.
-    pub rp_id_truncated: bool,
     /// The full credential ID.
     pub credential_id: &'a [u8],
 }
@@ -240,7 +237,6 @@ pub struct Reservation {
     generation: u32,
     rp_id_hash: [u8; KEY_LEN],
     rp_id: [u8; MAX_RP_ID_LEN],
-    /// The stored length, with [`RP_ID_TRUNCATED`] set for a truncated RP ID.
     rp_id_len: u8,
     /// The entry this one replaces owns a device-only key, which its commit frees.
     replaces_key: bool,
@@ -279,6 +275,37 @@ fn write_u32(record: &mut [u8], at: usize, value: u32) {
 
 fn is_zero(record: &[u8]) -> bool {
     record.iter().all(|&byte| byte == 0)
+}
+
+/// The stored form of `rp_id` and its length: CTAP 2.2 §6.8.7's truncation procedure with
+/// [`MAX_RP_ID_LEN`] for its 32-byte length (the protocol up to the first colon, U+2026, then the
+/// end of the RP ID). Where its byte offsets fall inside a UTF-8 character, the protocol stops and
+/// the end starts at the neighbouring boundary, so the stored RP ID stays text: credential
+/// management returns it as a CBOR text string, which must be UTF-8 (RFC 8949 §3.1, major type 3).
+/// Web RP IDs are ASCII domains, where this is the procedure exactly.
+fn stored_rp_id(rp_id: &str) -> ([u8; MAX_RP_ID_LEN], usize) {
+    let mut stored = [0u8; MAX_RP_ID_LEN];
+    let bytes = rp_id.as_bytes();
+    if bytes.len() <= MAX_RP_ID_LEN {
+        stored[..bytes.len()].copy_from_slice(bytes);
+        return (stored, bytes.len());
+    }
+    let mut used = 0;
+    if let Some(colon) = rp_id.find(':') {
+        used = rp_id.floor_char_boundary((colon + 1).min(MAX_RP_ID_LEN));
+        stored[..used].copy_from_slice(&bytes[..used]);
+    }
+    // `used` is at most MAX_RP_ID_LEN.
+    if MAX_RP_ID_LEN - used < ELLIPSIS.len() {
+        return (stored, used);
+    }
+    stored[used..used + ELLIPSIS.len()].copy_from_slice(ELLIPSIS.as_bytes());
+    used += ELLIPSIS.len();
+    // The RP ID is longer than MAX_RP_ID_LEN, so the start is past 0.
+    let start = rp_id.ceil_char_boundary(bytes.len() - (MAX_RP_ID_LEN - used));
+    let end = &bytes[start..];
+    stored[used..used + end.len()].copy_from_slice(end);
+    (stored, used + end.len())
 }
 
 /// Slot numbers are 16-bit in records and credential IDs; a region with more slots uses the
@@ -323,6 +350,11 @@ impl<S: Storage> Store<S> {
                 next_sequence: 0,
                 sequence_limit: 0,
             };
+            // Epoch 0: no earlier epoch survives here. Ledger OS replaces an application's NVM
+            // when it installs or updates the application, so a layout change only ever meets
+            // a fresh region, where the epoch of the previous install is already gone; earlier
+            // seed-recoverable credentials then open again until the encrypted backup, which
+            // carries the epoch, is restored, as the reset confirmation screen says.
             store.write_config(&Config::after_reset(0));
             return store;
         }
@@ -375,8 +407,11 @@ impl<S: Storage> Store<S> {
         self.storage.write_config(&record);
     }
 
-    /// authenticatorReset: empties the index and the key slots and writes the configuration
-    /// after a reset with the next epoch, all in one write, then wipes the slots.
+    /// authenticatorReset (CTAP 2.2 §6.6): empties the index and the key slots and writes the
+    /// configuration after a reset with the next epoch, all in one write, then wipes the slots.
+    /// §6.6 requires every credential to stop working and the PIN, `alwaysUv` and the
+    /// discoverable state to be cleared: device-only keys and entries are erased, and
+    /// seed-recoverable credential IDs of an earlier epoch are refused when opened.
     ///
     /// # Errors
     ///
@@ -426,8 +461,7 @@ impl<S: Storage> Store<S> {
         if record[ENTRY_STATE] != USED || read_u32(record, ENTRY_GENERATION) != self.generation {
             return None;
         }
-        let rp_id_truncated = record[ENTRY_RP_ID_LEN] & RP_ID_TRUNCATED != 0;
-        let rp_id_len = usize::from(record[ENTRY_RP_ID_LEN] & !RP_ID_TRUNCATED);
+        let rp_id_len = usize::from(record[ENTRY_RP_ID_LEN]);
         let credential_id_len = usize::from(read_u16(record, ENTRY_CREDENTIAL_ID_LEN));
         // The device wrote these within bounds; a record that is not is treated as free and
         // wiped on the next open.
@@ -445,7 +479,6 @@ impl<S: Storage> Store<S> {
             },
             rp_id_hash,
             rp_id,
-            rp_id_truncated,
             credential_id: &record[ENTRY_CREDENTIAL_ID..ENTRY_CREDENTIAL_ID + credential_id_len],
         })
     }
@@ -468,8 +501,8 @@ impl<S: Storage> Store<S> {
     /// Chooses the slot of a new discoverable credential: the slot of the credential that
     /// `same_user` recognises for this RP, which the new one replaces (CTAP 2.2 §6.1.2 step
     /// 17.2), or else a free slot. `same_user` opens a stored credential ID and compares its user
-    /// ID. An RP ID over [`MAX_RP_ID_LEN`] bytes is kept truncated on a character boundary, as
-    /// CTAP 2.2 §6.8.7 allows for the stored RP ID; `rp_id_hash` stays the full RP ID's.
+    /// ID. An RP ID over [`MAX_RP_ID_LEN`] bytes is kept in the truncated form of CTAP 2.2
+    /// §6.8.7; `rp_id_hash` stays the full RP ID's.
     ///
     /// # Errors
     ///
@@ -481,14 +514,9 @@ impl<S: Storage> Store<S> {
         rp_id: &str,
         mut same_user: impl FnMut(&IndexEntry<'_>) -> bool,
     ) -> Result<Reservation, StoreError> {
-        let kept = truncate_on_char_boundary(rp_id, MAX_RP_ID_LEN);
-        let mut stored_rp_id = [0u8; MAX_RP_ID_LEN];
-        stored_rp_id[..kept.len()].copy_from_slice(kept.as_bytes());
-        // At most MAX_RP_ID_LEN = 64, below the flag bit.
-        let mut rp_id_len = u8::try_from(kept.len()).map_err(|_| StoreError::TooLong)?;
-        if kept.len() < rp_id.len() {
-            rp_id_len |= RP_ID_TRUNCATED;
-        }
+        let (stored_rp_id, stored_len) = stored_rp_id(rp_id);
+        // At most MAX_RP_ID_LEN = 64.
+        let rp_id_len = u8::try_from(stored_len).map_err(|_| StoreError::TooLong)?;
         let sequence = u32::try_from(self.next_sequence).map_err(|_| StoreError::Exhausted)?;
         let mut free = None;
         let mut replaced = None;
@@ -601,7 +629,7 @@ impl<S: Storage> Store<S> {
             return Err(StoreError::TooLong);
         }
         let id = reservation.id;
-        let rp_id_len = usize::from(reservation.rp_id_len & !RP_ID_TRUNCATED);
+        let rp_id_len = usize::from(reservation.rp_id_len);
         let mut record = [0u8; INDEX_ENTRY_LEN];
         record[ENTRY_STATE] = USED;
         write_u32(&mut record, ENTRY_GENERATION, self.generation);
