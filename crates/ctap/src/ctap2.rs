@@ -10,29 +10,46 @@
 //!
 //! ```
 //! use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings, StatusCode};
+//! use structured_passkeys_ctap::soft::SoftCrypto;
+//! use structured_passkeys_ctap::storage::{MemoryStorage, Store};
 //! use structured_passkeys_ctap::ui::{Answer, Prompt, Ui, Verification};
 //!
 //! /// A user who confirms everything and has no PIN to enter.
 //! struct Present;
 //!
 //! impl Ui for Present {
-//!     fn confirm(&mut self, _prompt: Prompt, _timeout_ms: u32) -> Answer {
+//!     fn confirm(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Answer {
 //!         Answer::Confirmed
 //!     }
-//!     fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
+//!     fn verify_user(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Verification {
 //!         Verification::Blocked
+//!     }
+//!     fn uv_retries(&mut self) -> u8 {
+//!         0
+//!     }
+//!     fn now_ms(&self) -> u64 {
+//!         0
 //!     }
 //! }
 //!
 //! let max_msg_size = MaxMsgSize::try_from(1024).expect("at least 1024");
-//! let mut authenticator = Authenticator::new(Settings { max_msg_size });
+//! let crypto = SoftCrypto::new([1; 32], [2; 32]);
+//! let store = Store::open(MemoryStorage::new(4, 4));
+//! let mut authenticator = Authenticator::new(Settings { max_msg_size }, crypto, store);
 //! let mut response = [0u8; 128];
 //! let length = authenticator.process(&[0x04], &mut Present, &mut response);
 //! assert_eq!(response[0], StatusCode::Ok as u8);
 //! assert!(length > 1);
 //! ```
 
+mod client_pin;
+
+pub use client_pin::{ClientPinRequest, FEATURES, SubCommand};
+
 use crate::cbor::{self, Encoder, Full};
+use crate::crypto::Crypto;
+use crate::pin::{ClientPin, Protocol};
+use crate::storage::{Storage, Store};
 use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
 /// The AAGUID of this application, the same on every device (WebAuthn L3 §6.5.1).
@@ -273,24 +290,48 @@ pub struct Settings {
 }
 
 /// A parsed request, owning everything its execution needs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a command is moved once, from parsing to execution; boxing it would put every \
+              request on the device's 8 KiB heap instead"
+)]
 pub enum Command {
     /// authenticatorGetInfo (§6.4).
     GetInfo,
+    /// authenticatorClientPIN (§6.5).
+    ClientPin(ClientPinRequest),
     /// authenticatorSelection (§6.9).
     Selection,
 }
 
-/// The CTAP2 command processor.
+/// The CTAP2 command processor: the device's cryptography, its persistent state and the PIN/UV
+/// auth protocol state, which lives as long as the application is open.
 #[derive(Debug)]
-pub struct Authenticator {
+pub struct Authenticator<C, S> {
     settings: Settings,
+    crypto: C,
+    store: Store<S>,
+    client_pin: ClientPin,
 }
 
-impl Authenticator {
-    /// Creates the authenticator for a device described by `settings`.
-    pub const fn new(settings: Settings) -> Self {
-        Self { settings }
+impl<C: Crypto, S: Storage> Authenticator<C, S> {
+    /// Creates the authenticator for a device described by `settings`, with its cryptography and
+    /// its opened persistent state. Initializes the PIN/UV auth protocols as at power-up
+    /// (§6.5.5.1).
+    pub fn new(settings: Settings, mut crypto: C, store: Store<S>) -> Self {
+        let client_pin = ClientPin::new(&mut crypto);
+        Self {
+            settings,
+            crypto,
+            store,
+            client_pin,
+        }
+    }
+
+    /// The persistent state.
+    pub const fn store(&self) -> &Store<S> {
+        &self.store
     }
 
     /// Processes one request (command byte and CBOR parameters) and writes the response into
@@ -322,12 +363,14 @@ impl Authenticator {
                     _ => Command::GetInfo,
                 })
             }
+            Ok(CommandCode::ClientPin) => {
+                client_pin::parse(&self.crypto, parameters).map(Command::ClientPin)
+            }
             // §8.1: a command code the authenticator does not implement is
             // CTAP1_ERR_INVALID_COMMAND.
             Ok(
                 CommandCode::MakeCredential
                 | CommandCode::GetAssertion
-                | CommandCode::ClientPin
                 | CommandCode::Reset
                 | CommandCode::GetNextAssertion
                 | CommandCode::BioEnrollment
@@ -377,6 +420,7 @@ impl Authenticator {
     ) -> Result<(), StatusCode> {
         match command {
             Command::GetInfo => self.get_info(encoder).map_err(|Full| StatusCode::Other),
+            Command::ClientPin(request) => self.client_pin(&request, ui, encoder),
             Command::Selection => selection(ui),
         }
     }
@@ -387,7 +431,7 @@ impl Authenticator {
     /// an empty list is the truthful answer rather than an error for the command.
     fn get_info(&self, encoder: &mut Encoder<'_>) -> Result<(), Full> {
         encoder
-            .map(3)?
+            .map(4)?
             // versions (0x01), required.
             .unsigned(0x01)?
             .array(0)?
@@ -396,7 +440,13 @@ impl Authenticator {
             .bytes(&AAGUID)?
             // maxMsgSize (0x05).
             .unsigned(0x05)?
-            .unsigned(u64::from(self.settings.max_msg_size.get()))?;
+            .unsigned(u64::from(self.settings.max_msg_size.get()))?
+            // pinUvAuthProtocols (0x06), in order of preference.
+            .unsigned(0x06)?
+            .array(Protocol::SUPPORTED.len())?;
+        for protocol in Protocol::SUPPORTED {
+            encoder.unsigned(u64::from(protocol as u8))?;
+        }
         Ok(())
     }
 }

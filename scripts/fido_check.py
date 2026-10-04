@@ -21,9 +21,21 @@ confirming answers CTAP2_OK and refusing CTAP2_ERR_OPERATION_DENIED. In Speculos
 answers the screen itself through the Speculos API and compares the selection screen with the
 snapshot of the model in `--snapshots` (`--golden` writes it instead); on a device it asks the
 person at the device to answer.
+
+authenticatorClientPIN (§6.5), in Speculos, whose NVM starts empty: getInfo lists PIN/UV auth
+protocols 2 and 1; setPIN; getPinToken with both protocols after consent on the device, the token
+decrypting to 32 bytes; a wrong PIN spends a try (CTAP2_ERR_PIN_INVALID) and a correct one
+restores the tries; a refused consent spends none (CTAP2_ERR_OPERATION_DENIED); changePIN, after
+which the old PIN is wrong. The consent screen is compared with its snapshot like the selection
+screen.
+
+    fido_check.py --uv        on a device: built-in user verification with the device PIN, which
+                              the person enters on the device keypad, then once with a wrong PIN,
+                              after which built-in verification is blocked until a correct entry
 """
 
 import argparse
+import hashlib
 import json
 import os
 import socket
@@ -36,6 +48,7 @@ from pathlib import Path
 
 from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2
+from fido2.ctap2.pin import PinProtocolV1, PinProtocolV2
 from fido2.hid import CAPABILITY, CtapHidDevice, list_descriptors, open_connection
 from fido2.hid.base import CtapHidConnection, HidDescriptor
 
@@ -61,6 +74,22 @@ TIMEOUT_SLACK_S = 5
 SELECTION_TITLE = "Allow security key access?"
 SELECTION_CONFIRM = "Allow"
 SELECTION_REJECT = "Don't allow"
+# The title of the consent screen for a pinUvAuthToken obtained with the client PIN.
+TOKEN_TITLE = "Use your security key PIN?"
+# authenticatorClientPIN subcommands and response members (§6.5.5).
+GET_PIN_RETRIES = 0x01
+GET_KEY_AGREEMENT = 0x02
+SET_PIN = 0x03
+CHANGE_PIN = 0x04
+GET_PIN_TOKEN = 0x05
+GET_TOKEN_USING_UV = 0x06
+GET_UV_RETRIES = 0x07
+KEY_AGREEMENT = 0x01
+PIN_UV_AUTH_TOKEN = 0x02
+PIN_RETRIES = 0x03
+UV_RETRIES = 0x05
+# getAssertion permission (§6.5.5.7).
+PERMISSION_GA = 0x02
 
 
 class KeepaliveLog:
@@ -290,20 +319,191 @@ def check(condition: bool, message: str) -> None:
     print(f"ok: {message}")
 
 
-def snapshot_check(model: str, directory: Path, golden: bool):
-    """Compares the shown selection screen with the model's snapshot, or writes it with
-    `golden`."""
-    path = directory / model / "selection.png"
+def ctap_status(call) -> int:
+    """Runs `call` and returns its CTAP status: success, or the error it raised."""
+    try:
+        call()
+        return CtapError.ERR.SUCCESS
+    except CtapError as error:
+        return error.code
+
+
+def padded_pin(pin: str) -> bytes:
+    """The PIN padded with zeros to 64 bytes (§6.5.5.5)."""
+    encoded = pin.encode()
+    return encoded + b"\0" * (64 - len(encoded))
+
+
+def pin_hash(pin: str) -> bytes:
+    """LEFT(SHA-256(PIN), 16) (§6.5.5.6)."""
+    return hashlib.sha256(pin.encode()).digest()[:16]
+
+
+class PinSession:
+    """The platform side of one key agreement with `protocol` (§6.5.5.4)."""
+
+    def __init__(self, ctap: Ctap2, protocol):
+        self.ctap = ctap
+        self.protocol = protocol
+        response = ctap.client_pin(protocol.VERSION, GET_KEY_AGREEMENT)
+        self.key_agreement, self.secret = protocol.encapsulate(response[KEY_AGREEMENT])
+
+    def client_pin(self, sub_command: int, **members):
+        return self.ctap.client_pin(
+            self.protocol.VERSION, sub_command, key_agreement=self.key_agreement, **members
+        )
+
+
+def set_pin(ctap: Ctap2, protocol, pin: str) -> None:
+    session = PinSession(ctap, protocol)
+    new_pin_enc = protocol.encrypt(session.secret, padded_pin(pin))
+    session.client_pin(
+        SET_PIN,
+        new_pin_enc=new_pin_enc,
+        pin_uv_param=protocol.authenticate(session.secret, new_pin_enc),
+    )
+
+
+def change_pin(ctap: Ctap2, protocol, old: str, new: str) -> None:
+    session = PinSession(ctap, protocol)
+    pin_hash_enc = protocol.encrypt(session.secret, pin_hash(old))
+    new_pin_enc = protocol.encrypt(session.secret, padded_pin(new))
+    session.client_pin(
+        CHANGE_PIN,
+        new_pin_enc=new_pin_enc,
+        pin_hash_enc=pin_hash_enc,
+        pin_uv_param=protocol.authenticate(session.secret, new_pin_enc + pin_hash_enc),
+    )
+
+
+def pin_token(ctap: Ctap2, protocol, pin: str) -> bytes:
+    """getPinToken (§6.5.5.7.1): the decrypted pinUvAuthToken."""
+    session = PinSession(ctap, protocol)
+    response = session.client_pin(
+        GET_PIN_TOKEN, pin_hash_enc=protocol.encrypt(session.secret, pin_hash(pin))
+    )
+    return protocol.decrypt(session.secret, response[PIN_UV_AUTH_TOKEN])
+
+
+def pin_retries(ctap: Ctap2) -> int:
+    return ctap.client_pin(2, GET_PIN_RETRIES)[PIN_RETRIES]
+
+
+def answered(user, confirm: bool, title: str, call, snapshot=None) -> int:
+    """Runs `call` while the user answers the screen titled `title`; returns its CTAP status.
+    The answer runs in a timer's thread; an exception there is kept and raised here."""
+    failure: list[BaseException] = []
+
+    def answer() -> None:
+        try:
+            if isinstance(user, SpeculosUser):
+                wait_for_screen(title)
+            if snapshot is not None:
+                snapshot()
+            user.answer(confirm)
+        except BaseException as error:
+            failure.append(error)
+
+    timer = threading.Timer(1.0, answer)
+    timer.start()
+    status = ctap_status(call)
+    timer.join()
+    if failure:
+        raise failure[0]
+    return status
+
+
+def check_client_pin(device: CtapHidDevice, user, snapshot) -> None:
+    ctap = Ctap2(device)
+    check(
+        ctap.info.pin_uv_protocols == [2, 1],
+        f"getInfo: pinUvAuthProtocols {ctap.info.pin_uv_protocols}",
+    )
+    check(pin_retries(ctap) == 8, "clientPIN: eight tries on fresh NVM")
+    check(
+        ctap_status(lambda: set_pin(ctap, PinProtocolV2(), "1234")) == CtapError.ERR.SUCCESS,
+        "clientPIN: setPIN",
+    )
+    for protocol, shot in ((PinProtocolV2(), snapshot), (PinProtocolV1(), None)):
+        name = f"protocol {protocol.VERSION}"
+        token: list[bytes] = []
+        status = answered(
+            user, True, TOKEN_TITLE, lambda p=protocol: token.append(pin_token(ctap, p, "1234")), shot
+        )
+        check(
+            status == CtapError.ERR.SUCCESS and len(token[0]) == 32,
+            f"clientPIN {name}: getPinToken after consent gives a 32-byte token",
+        )
+        status = answered(user, True, TOKEN_TITLE, lambda p=protocol: pin_token(ctap, p, "0000"))
+        check(
+            status == CtapError.ERR.PIN_INVALID and pin_retries(ctap) == 7,
+            f"clientPIN {name}: a wrong PIN spends a try ({status!r})",
+        )
+        status = answered(user, True, TOKEN_TITLE, lambda p=protocol: pin_token(ctap, p, "1234"))
+        check(
+            status == CtapError.ERR.SUCCESS and pin_retries(ctap) == 8,
+            f"clientPIN {name}: the right PIN restores the tries",
+        )
+    status = answered(user, False, TOKEN_TITLE, lambda: pin_token(ctap, PinProtocolV2(), "0000"))
+    check(
+        status == CtapError.ERR.OPERATION_DENIED and pin_retries(ctap) == 8,
+        f"clientPIN: a refused consent spends no try ({status!r})",
+    )
+    check(
+        ctap_status(lambda: change_pin(ctap, PinProtocolV2(), "1234", "98765"))
+        == CtapError.ERR.SUCCESS,
+        "clientPIN: changePIN",
+    )
+    status = answered(user, True, TOKEN_TITLE, lambda: pin_token(ctap, PinProtocolV2(), "1234"))
+    check(status == CtapError.ERR.PIN_INVALID, f"clientPIN: the old PIN is wrong now ({status!r})")
+
+
+def check_built_in_uv(device: CtapHidDevice) -> None:
+    """Built-in user verification on a device, with the person entering the device PIN."""
+    ctap = Ctap2(device)
+    protocol = PinProtocolV2()
+
+    def uv_token() -> bytes:
+        session = PinSession(ctap, protocol)
+        response = session.client_pin(
+            GET_TOKEN_USING_UV, permissions=PERMISSION_GA, permissions_rpid="example.com"
+        )
+        return protocol.decrypt(session.secret, response[PIN_UV_AUTH_TOKEN])
+
+    def uv_retries() -> int:
+        return ctap.client_pin(2, GET_UV_RETRIES)[UV_RETRIES]
+
+    check(uv_retries() == 1, "built-in UV: one attempt offered while the device count is full")
+    print("   on the device, enter the device PIN", flush=True)
+    token: list[bytes] = []
+    status = ctap_status(lambda: token.append(uv_token()))
+    check(
+        status == CtapError.ERR.SUCCESS and len(token[0]) == 32,
+        f"built-in UV: the device PIN gives a token ({status!r})",
+    )
+    print("   on the device, enter a WRONG device PIN once (one of the device's three tries)")
+    status = ctap_status(uv_token)
+    check(status == CtapError.ERR.UV_BLOCKED, f"built-in UV: a wrong PIN blocks it ({status!r})")
+    check(uv_retries() == 0, "built-in UV: no attempt offered while the device count is not full")
+    status = ctap_status(uv_token)
+    check(status == CtapError.ERR.UV_BLOCKED, "built-in UV: refused without a keypad")
+    print("   unlock the device again with the correct PIN to restore its count")
+
+
+def snapshot_check(model: str, directory: Path, golden: bool, name: str, title: str):
+    """Compares the shown screen titled `title` with the model's snapshot `name`, or writes it
+    with `golden`."""
+    path = directory / model / f"{name}.png"
 
     def compare() -> None:
-        wait_for_screen(SELECTION_TITLE)
+        wait_for_screen(title)
         shot = api("/screenshot")
         if golden:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(shot)
-            print(f"ok: selection screen written to {path}")
+            print(f"ok: {name} screen written to {path}")
             return
-        check(path.is_file() and path.read_bytes() == shot, f"selection screen matches {path}")
+        check(path.is_file() and path.read_bytes() == shot, f"{name} screen matches {path}")
 
     return compare
 
@@ -314,6 +514,7 @@ def main() -> None:
     parser.add_argument("--model", help="Speculos model, for the screen and the snapshot")
     parser.add_argument("--snapshots", type=Path, help="directory of the screen snapshots")
     parser.add_argument("--golden", action="store_true", help="write the snapshots instead")
+    parser.add_argument("--uv", action="store_true", help="built-in user verification on a device")
     args = parser.parse_args()
 
     keepalives = KeepaliveLog()
@@ -336,15 +537,25 @@ def main() -> None:
         if args.model is None:
             raise SystemExit("--speculos needs --model for the screen")
         user = SpeculosUser(args.model)
-        snapshot = (
-            snapshot_check(args.model, args.snapshots, args.golden)
-            if args.snapshots is not None
-            else None
-        )
+        snapshots = args.snapshots
+
+        def snapshot(name: str, title: str):
+            if snapshots is None:
+                return None
+            return snapshot_check(args.model, snapshots, args.golden, name, title)
+
     else:
         user = PersonAtDevice()
-        snapshot = None
-    check_selection(device, keepalives, user, snapshot)
+
+        def snapshot(name: str, title: str):
+            return None
+
+    check_selection(device, keepalives, user, snapshot("selection", SELECTION_TITLE))
+    if args.speculos:
+        # Speculos starts with empty NVM, so the PIN can be set; a device keeps its PIN.
+        check_client_pin(device, user, snapshot("token", TOKEN_TITLE))
+    if args.uv:
+        check_built_in_uv(device)
     device.close()
 
 

@@ -12,6 +12,8 @@ pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 /// AES-GCM tag length (128 bits).
 pub const TAG_LEN: usize = 16;
+/// AES block length, the length of an AES-CBC initialization vector.
+pub const AES_BLOCK_LEN: usize = 16;
 /// Uncompressed SEC1 P-256 public key: `0x04 || x || y`.
 pub const PUBLIC_KEY_LEN: usize = 65;
 /// Longest DER-encoded P-256 ECDSA signature (two 33-byte integers and their headers).
@@ -24,6 +26,10 @@ pub enum CryptoError {
     Authentication,
     /// A private key outside `1..n` of P-256.
     InvalidKey,
+    /// A public key that is not a point of P-256.
+    InvalidPoint,
+    /// AES-CBC data whose length is not a multiple of [`AES_BLOCK_LEN`].
+    Length,
 }
 
 impl core::fmt::Display for CryptoError {
@@ -31,6 +37,8 @@ impl core::fmt::Display for CryptoError {
         formatter.write_str(match self {
             CryptoError::Authentication => "authentication failed",
             CryptoError::InvalidKey => "invalid private key",
+            CryptoError::InvalidPoint => "invalid public key",
+            CryptoError::Length => "data is not a whole number of AES blocks",
         })
     }
 }
@@ -94,6 +102,43 @@ pub trait Crypto {
         data: &mut [u8],
         tag: &[u8; TAG_LEN],
     ) -> Result<(), CryptoError>;
+
+    /// Encrypts `data` in place with AES-256-CBC from `iv`, without padding.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Length`] when `data` is not a whole number of blocks; `data` is unchanged.
+    fn aes256_cbc_encrypt(
+        &self,
+        key: &[u8; KEY_LEN],
+        iv: &[u8; AES_BLOCK_LEN],
+        data: &mut [u8],
+    ) -> Result<(), CryptoError>;
+
+    /// Decrypts `data` in place with AES-256-CBC from `iv`, without padding.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Length`] when `data` is not a whole number of blocks; `data` is unchanged.
+    fn aes256_cbc_decrypt(
+        &self,
+        key: &[u8; KEY_LEN],
+        iv: &[u8; AES_BLOCK_LEN],
+        data: &mut [u8],
+    ) -> Result<(), CryptoError>;
+
+    /// The x-coordinate of `private_key` times the point `peer` (uncompressed SEC1), the shared
+    /// secret `Z` of P-256 ECDH (SP 800-56A §5.7.1.2).
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::InvalidPoint`] for a `peer` that is not on the curve,
+    /// [`CryptoError::InvalidKey`] for a scalar outside `1..n`.
+    fn p256_ecdh(
+        &self,
+        private_key: &[u8; KEY_LEN],
+        peer: &[u8; PUBLIC_KEY_LEN],
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError>;
 
     /// The uncompressed public key of a P-256 private key.
     ///

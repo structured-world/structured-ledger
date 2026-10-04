@@ -105,6 +105,29 @@ impl Crypto for RejectFirstCounter {
     ) -> Result<(), CryptoError> {
         self.0.aes256_gcm_open(key, nonce, aad, data, tag)
     }
+    fn aes256_cbc_encrypt(
+        &self,
+        key: &[u8; KEY_LEN],
+        iv: &[u8; 16],
+        data: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        self.0.aes256_cbc_encrypt(key, iv, data)
+    }
+    fn aes256_cbc_decrypt(
+        &self,
+        key: &[u8; KEY_LEN],
+        iv: &[u8; 16],
+        data: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        self.0.aes256_cbc_decrypt(key, iv, data)
+    }
+    fn p256_ecdh(
+        &self,
+        private_key: &[u8; KEY_LEN],
+        peer: &[u8; PUBLIC_KEY_LEN],
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
+        self.0.p256_ecdh(private_key, peer)
+    }
     fn p256_public_key(
         &self,
         private_key: &[u8; KEY_LEN],

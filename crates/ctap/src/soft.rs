@@ -5,6 +5,8 @@
 
 use core::fmt;
 
+use aes::Aes256;
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt};
 use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use hmac::digest::FixedOutput;
@@ -14,7 +16,9 @@ use p256::ecdsa::{DerSignature, SigningKey};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::crypto::{Crypto, CryptoError, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, Signature, TAG_LEN};
+use crate::crypto::{
+    AES_BLOCK_LEN, Crypto, CryptoError, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, Signature, TAG_LEN,
+};
 
 /// Software cryptography with a fixed application node and a seeded generator. Its `Debug`
 /// output never prints the node or the seed, and both are zeroized on drop.
@@ -111,6 +115,72 @@ impl Crypto for SoftCrypto {
         cipher
             .decrypt_inout_detached(&Nonce::from(*nonce), aad, data.into(), &Tag::from(*tag))
             .map_err(|_| CryptoError::Authentication)
+    }
+
+    fn aes256_cbc_encrypt(
+        &self,
+        key: &[u8; KEY_LEN],
+        iv: &[u8; AES_BLOCK_LEN],
+        data: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        if !data.len().is_multiple_of(AES_BLOCK_LEN) {
+            return Err(CryptoError::Length);
+        }
+        let cipher = Aes256::new(key.into());
+        let mut chain = *iv;
+        for chunk in data.as_chunks_mut::<AES_BLOCK_LEN>().0 {
+            // C_i = E(P_i xor C_{i-1}), C_0 = IV (SP 800-38A §6.2).
+            let mut block = aes::Block::default();
+            for ((byte, &plain), &previous) in block.iter_mut().zip(&*chunk).zip(&chain) {
+                *byte = plain ^ previous;
+            }
+            cipher.encrypt_block(&mut block);
+            chunk.copy_from_slice(&block);
+            chain.copy_from_slice(&block);
+        }
+        Ok(())
+    }
+
+    fn aes256_cbc_decrypt(
+        &self,
+        key: &[u8; KEY_LEN],
+        iv: &[u8; AES_BLOCK_LEN],
+        data: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        if !data.len().is_multiple_of(AES_BLOCK_LEN) {
+            return Err(CryptoError::Length);
+        }
+        let cipher = Aes256::new(key.into());
+        let mut chain = *iv;
+        for chunk in data.as_chunks_mut::<AES_BLOCK_LEN>().0 {
+            // P_i = D(C_i) xor C_{i-1}, C_0 = IV (SP 800-38A §6.2).
+            let mut block = aes::Block::default();
+            block.copy_from_slice(chunk);
+            let ciphertext = block;
+            cipher.decrypt_block(&mut block);
+            for ((byte, &plain), &previous) in chunk.iter_mut().zip(&block).zip(&chain) {
+                *byte = plain ^ previous;
+            }
+            block.zeroize();
+            chain.copy_from_slice(&ciphertext);
+        }
+        Ok(())
+    }
+
+    fn p256_ecdh(
+        &self,
+        private_key: &[u8; KEY_LEN],
+        peer: &[u8; PUBLIC_KEY_LEN],
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
+        let secret =
+            p256::SecretKey::from_slice(private_key).map_err(|_| CryptoError::InvalidKey)?;
+        // Decoding checks that the point is on the curve (SEC 1 §2.3.4).
+        let public =
+            p256::PublicKey::from_sec1_bytes(peer).map_err(|_| CryptoError::InvalidPoint)?;
+        let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
+        let mut z = Zeroizing::new([0u8; KEY_LEN]);
+        z.copy_from_slice(shared.raw_secret_bytes());
+        Ok(z)
     }
 
     fn p256_public_key(
