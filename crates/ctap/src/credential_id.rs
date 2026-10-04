@@ -151,6 +151,8 @@ pub enum OpenError {
     Authentication,
     /// The authenticated plaintext is not a credential of this format.
     Plaintext,
+    /// Created before a reset: its epoch is below the stored one, so the reset revoked it.
+    Revoked,
 }
 
 /// Why a credential is refused when sealing.
@@ -292,13 +294,32 @@ pub fn seal<C: Crypto>(
     Ok(id)
 }
 
-/// Opens a credential ID presented for `rp_id`.
+/// Opens a credential ID presented for `rp_id` on a device whose reset epoch is `epoch`. An ID
+/// with a lower epoch was created before a reset, which revoked it; a seed-recoverable one would
+/// still derive its key from the recovery phrase, so the epoch is what refuses it. A higher epoch
+/// is accepted: after NVM was wiped without a restore the stored epoch starts over at 0, and the
+/// credentials the phrase reproduces work again.
 ///
 /// # Errors
 ///
-/// [`OpenError`] when the ID was not sealed by this device for this RP, or is not of this
-/// format.
+/// [`OpenError`] when the ID was not sealed by this device for this RP, is not of this format,
+/// or was revoked by a reset ([`OpenError::Revoked`]).
 pub fn open<C: Crypto>(
+    crypto: &C,
+    keys: &KeyRing,
+    rp_id: &str,
+    id: &[u8],
+    epoch: u32,
+) -> Result<Credential, OpenError> {
+    let credential = open_any_epoch(crypto, keys, rp_id, id)?;
+    if credential.epoch < epoch {
+        return Err(OpenError::Revoked);
+    }
+    Ok(credential)
+}
+
+/// Opens a credential ID whatever its epoch.
+fn open_any_epoch<C: Crypto>(
     crypto: &C,
     keys: &KeyRing,
     rp_id: &str,

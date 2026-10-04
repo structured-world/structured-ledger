@@ -17,7 +17,7 @@ pub fn run(data: &[u8]) {
     let mut crypto = SoftCrypto::new([0x11; KEY_LEN], [0x22; KEY_LEN]);
     let keys = KeyRing::new(&mut crypto);
 
-    if let Ok(credential) = credential_id::open(&crypto, &keys, RP, data) {
+    if let Ok(credential) = credential_id::open(&crypto, &keys, RP, data, 0) {
         round_trip(&mut crypto, &keys, &credential);
     }
 
@@ -28,7 +28,7 @@ pub fn run(data: &[u8]) {
     let mut plaintext = data.to_vec();
     let tag = crypto.aes256_gcm_seal(&keys.wrap_key(&crypto), &nonce, &aad, &mut plaintext);
     let id = [&[VERSION][..], &nonce, &plaintext, &tag].concat();
-    match credential_id::open(&crypto, &keys, RP, &id) {
+    match credential_id::open(&crypto, &keys, RP, &id, 0) {
         Ok(credential) => round_trip(&mut crypto, &keys, &credential),
         // A plaintext that is not a credential, or too long for any credential ID.
         Err(OpenError::Plaintext | OpenError::Length) => {}
@@ -36,16 +36,23 @@ pub fn run(data: &[u8]) {
     }
 }
 
-/// An opened credential seals again and opens to the same value, for its RP only.
+/// An opened credential seals again and opens to the same value, for its RP only, on a device
+/// whose reset epoch is not above the credential's; a later epoch revokes it.
 fn round_trip(crypto: &mut SoftCrypto, keys: &KeyRing, credential: &credential_id::Credential) {
     let id = credential_id::seal(crypto, keys, RP, credential).expect("an opened credential fits");
     assert!(id.len() <= credential_id::MAX_CREDENTIAL_ID_LEN);
     assert_eq!(
-        credential_id::open(crypto, keys, RP, &id).as_ref(),
+        credential_id::open(crypto, keys, RP, &id, credential.epoch).as_ref(),
         Ok(credential)
     );
     assert_eq!(
-        credential_id::open(crypto, keys, "example.org", &id),
+        credential_id::open(crypto, keys, "example.org", &id, 0),
         Err(OpenError::Authentication)
     );
+    if let Some(later) = credential.epoch.checked_add(1) {
+        assert_eq!(
+            credential_id::open(crypto, keys, RP, &id, later),
+            Err(OpenError::Revoked)
+        );
+    }
 }

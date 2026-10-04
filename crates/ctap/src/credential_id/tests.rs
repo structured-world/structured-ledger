@@ -4,12 +4,48 @@
 
 use super::{
     CredProtect, Credential, KeySource, MAX_CREDENTIAL_ID_LEN, MAX_NAME_LEN, MAX_USER_ID_LEN,
-    OpenError, SealError, User, VERSION, open, seal, truncate_on_char_boundary,
+    OpenError, SealError, User, VERSION, seal, truncate_on_char_boundary,
 };
 use crate::attestation::ES256;
 use crate::crypto::{Crypto, KEY_LEN, NONCE_LEN};
 use crate::keys::KeyRing;
 use crate::soft::SoftCrypto;
+
+/// Opens on a device that was never reset (epoch 0), which opens every epoch.
+fn open(
+    crypto: &SoftCrypto,
+    keys: &KeyRing,
+    rp_id: &str,
+    id: &[u8],
+) -> Result<Credential, OpenError> {
+    super::open(crypto, keys, rp_id, id, 0)
+}
+
+/// A reset revokes what it leaves behind: an ID of epoch 2 opens on a device at epoch 2 and
+/// is refused at epoch 3, whatever its key origin; a device whose NVM was wiped back to epoch 0
+/// opens it again.
+#[test]
+fn a_reset_revokes_older_ids() {
+    let (mut crypto, keys) = platform();
+    for credential in [
+        Credential {
+            epoch: 2,
+            ..seed_credential()
+        },
+        slot_credential(),
+    ] {
+        let id = seal(&mut crypto, &keys, RP, &credential).expect("fits");
+        assert_eq!(
+            super::open(&crypto, &keys, RP, &id, 2).as_ref(),
+            Ok(&credential)
+        );
+        assert_eq!(
+            super::open(&crypto, &keys, RP, &id, 3),
+            Err(OpenError::Revoked)
+        );
+        assert_eq!(super::open(&crypto, &keys, RP, &id, 0), Ok(credential));
+    }
+}
 
 fn hex(text: &str) -> Vec<u8> {
     (0..text.len())
